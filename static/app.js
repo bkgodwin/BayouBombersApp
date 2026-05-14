@@ -6,10 +6,6 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.disabled = true;
         btn.dataset.original = btn.textContent || 'Submit';
         btn.textContent = 'Saving...';
-        setTimeout(() => {
-          btn.disabled = false;
-          btn.textContent = btn.dataset.original || 'Submit';
-        }, 3000);
       }
     });
   });

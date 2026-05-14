@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -322,11 +323,36 @@ def read_template(name: str) -> str:
 
 
 def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    allowed_tables = {
+        "users",
+        "athletes",
+        "training_modules",
+        "practice_plans",
+        "practice_plan_items",
+        "assignments",
+        "throw_logs",
+        "lift_logs",
+        "meet_results",
+        "prs",
+        "schools",
+        "galleries",
+        "site_settings",
+    }
+    if table not in allowed_tables:
+        raise ValueError("Unsupported table name")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
+        raise ValueError("Invalid column name")
     cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(c["name"] == column for c in cols)
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str, default_sql: str = "") -> None:
+    if table not in {"users", "athletes"}:
+        raise ValueError("Unsupported table for schema alteration")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
+        raise ValueError("Invalid column name")
+    if sql_type not in {"INTEGER", "TEXT", "REAL"}:
+        raise ValueError("Unsupported SQL type")
     if not column_exists(conn, table, column):
         default_part = f" DEFAULT {default_sql}" if default_sql else ""
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}{default_part}")
@@ -1657,9 +1683,6 @@ def run_server(host: str, port: int) -> None:
     init_db()
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"Bayou Bombers app running at http://{host}:{port}")
-    print("Default admin login: admin@admin.com / password123")
-    print("Demo coach login: coach / coach123")
-    print("Demo athlete login: athlete / athlete123")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
