@@ -631,7 +631,6 @@ class AppHandler(BaseHTTPRequestHandler):
             f"<tr><td>{m['id']}</td><td>{esc(m['name'])}</td><td>{esc(m['category'])}</td><td>{esc(m['description'])}</td></tr>"
             for m in modules
         )
-        plans_html = "".join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"
         body = f"""
         <div class='grid'>
           <div class='card'>
@@ -694,6 +693,7 @@ class AppHandler(BaseHTTPRequestHandler):
             f"<option value='{m['id']}'>{esc(m['name'])} ({esc(m['category'])})</option>" for m in modules
         )
         athlete_help = ", ".join(f"{a['id']}={esc(a['athlete_name'])}" for a in athletes) or "No athletes found"
+        plans_html = "".join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"
 
         body = f"""
         <div class='grid'>
