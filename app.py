@@ -279,7 +279,7 @@ def init_db() -> None:
         ensure_column(conn, "users", "profile_image_url", "TEXT", "''")
         ensure_column(conn, "users", "email", "TEXT", "''")
         ensure_column(conn, "athletes", "coach_user_id", "INTEGER")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_status_updates_user_created ON status_updates(user_id, created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_status_updates_user_created ON status_updates(user_id, created_at)")
 
         users = conn.execute("SELECT id, username, name, email FROM users ORDER BY id").fetchall()
         for row in users:
@@ -481,6 +481,17 @@ def optional_http_url(value: str) -> str:
         return ""
     parsed = urlparse(cleaned)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return cleaned
+    return ""
+
+
+def optional_image_url(value: str) -> str:
+    cleaned = optional_http_url(value)
+    if not cleaned:
+        return ""
+    parsed = urlparse(cleaned)
+    image_type = mimetypes.guess_type(parsed.path)[0] or ""
+    if image_type.startswith("image/"):
         return cleaned
     return ""
 
@@ -949,11 +960,11 @@ class AppHandler(BaseHTTPRequestHandler):
             is_owner = bool(current_user and current_user["id"] == row["id"])
             if not can_display_public_images(row, current_user, hide_minor_images, is_owner):
                 avatar = "/static/default-avatar.svg"
-            handle = f"@{row['username']}" if row["username"] else row["role"]
+            display_handle = f"@{row['username']}" if row["username"] else row["role"]
             cards.append(
                 f"<a class='card profile-link' href='/profile/{row['id']}'>"
                 f"<div class='profile-head'><img class='avatar' src='{esc(avatar)}' alt='avatar'>"
-                f"<div><h3>{esc(row['name'])}</h3><p class='muted'>{esc(handle)} • {esc(row['role'])} {esc(row['school_name'])}</p></div></div></a>"
+                f"<div><h3>{esc(row['name'])}</h3><p class='muted'>{esc(display_handle)} • {esc(row['role'])} {esc(row['school_name'])}</p></div></div></a>"
             )
         cards_html = "".join(cards) or "<div class='card'>No profiles found.</div>"
         body = (
@@ -1162,7 +1173,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     email,
                     form.get("status_text", "").strip(),
                     form.get("bio", "").strip(),
-                    optional_http_url(form.get("profile_image_url", "")),
+                    optional_image_url(form.get("profile_image_url", "")),
                     form.get("grade_level", "").strip(),
                     to_int(form.get("age", "0"), 0) or None,
                     form.get("height", "").strip(),
@@ -1184,13 +1195,13 @@ class AppHandler(BaseHTTPRequestHandler):
         with db_conn() as conn:
             conn.execute(
                 "INSERT INTO status_updates (user_id, body, image_url, created_at) VALUES (?,?,?,?)",
-                (user["id"], body, optional_http_url(form.get("image_url", "")), utc_now().isoformat(timespec="seconds")),
+                (user["id"], body, optional_image_url(form.get("image_url", "")), utc_now().isoformat(timespec="seconds")),
             )
         self.redirect(f"/profile/{user['id']}")
 
     def add_gallery_photo(self, user: sqlite3.Row) -> None:
         form = self.read_form()
-        image_url = optional_http_url(form.get("image_url", ""))
+        image_url = optional_image_url(form.get("image_url", ""))
         if not image_url:
             return self.redirect(f"/profile/{user['id']}")
         with db_conn() as conn:
