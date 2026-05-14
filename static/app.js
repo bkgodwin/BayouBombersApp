@@ -24,4 +24,21 @@ document.addEventListener('DOMContentLoaded', () => {
       toggle.setAttribute('aria-expanded', String(isOpen));
     });
   }
+
+  // Coach plan assignment select-all controls
+  document.querySelectorAll('form[action="/coach/assign"]').forEach((form) => {
+    const selectAll = form.querySelector('.plan-select-all');
+    const checks = Array.from(form.querySelectorAll('input[type="checkbox"][name="athlete_ids"]'));
+    if (!selectAll || !checks.length) return;
+
+    selectAll.addEventListener('change', () => {
+      checks.forEach((check) => { check.checked = selectAll.checked; });
+    });
+
+    checks.forEach((check) => {
+      check.addEventListener('change', () => {
+        selectAll.checked = checks.every((item) => item.checked);
+      });
+    });
+  });
 });
