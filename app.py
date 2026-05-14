@@ -918,8 +918,14 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def serve_static(self, path: str) -> None:
         rel = path.removeprefix("/static/")
+        # Reject any path containing traversal sequences before resolving
+        if ".." in rel or rel.startswith("/"):
+            return self.respond_html("Not Found", status=404)
         target = (STATIC_DIR / rel).resolve()
-        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.exists() or not target.is_file():
+        static_root = STATIC_DIR.resolve()
+        if not str(target).startswith(str(static_root) + "/") and target != static_root:
+            return self.respond_html("Not Found", status=404)
+        if not target.exists() or not target.is_file():
             return self.respond_html("Not Found", status=404)
         mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         self.respond_bytes(target.read_bytes(), mime)
