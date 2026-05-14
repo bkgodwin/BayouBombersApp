@@ -430,6 +430,11 @@ class AppHandler(BaseHTTPRequestHandler):
             headers["Set-Cookie"] = cookie_header
         self.respond_html("", status=302, extra_headers=headers)
 
+    def session_cookie_flags(self) -> str:
+        host = (self.headers.get("Host") or "").split(":")[0].lower()
+        secure = "" if host in {"127.0.0.1", "localhost"} else "; Secure"
+        return f"HttpOnly; Path=/; SameSite=Lax{secure}"
+
     def handle_login(self, form: dict[str, str]) -> None:
         username = form.get("username", "").strip()
         password = form.get("password", "")
@@ -439,7 +444,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.respond_html(login_page("Invalid username or password."), status=401)
         token = secrets.token_urlsafe(24)
         SESSIONS[token] = {"user_id": str(user["id"]), "created": datetime.now(timezone.utc).isoformat()}
-        cookie = f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax"
+        cookie = f"{SESSION_COOKIE}={token}; {self.session_cookie_flags()}"
         self.redirect("/coach" if user["role"] == "coach" else "/athlete", cookie)
 
     def handle_logout(self) -> None:
@@ -910,6 +915,7 @@ class AppHandler(BaseHTTPRequestHandler):
         form = self.read_form()
         weight = max(to_float(form.get("weight", "0"), 0.0), 0.0)
         reps = max(to_int(form.get("reps", "1"), 1), 1)
+        # Epley-estimated one-rep max: weight * (1 + reps/30).
         projected_max = round(weight * (1 + reps / 30), 1)
         lift_name = form.get("lift_name", "Lift").strip() or "Lift"
         with db_conn() as conn:
