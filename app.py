@@ -433,8 +433,7 @@ def next_available_email(conn: sqlite3.Connection, seed: str, exclude_user_id: i
     local = slugify_text(local_part or "member")
     domain = re.sub(r"[^a-z0-9.-]+", "", domain_part.lower()).strip(".") or "bayoubombers.app"
     candidate = f"{local}@{domain}"
-    suffix = 2
-    while True:
+    for suffix in range(2, 1002):
         params: tuple[object, ...]
         query = "SELECT id FROM users WHERE email=?"
         if exclude_user_id is None:
@@ -445,7 +444,7 @@ def next_available_email(conn: sqlite3.Connection, seed: str, exclude_user_id: i
         if conn.execute(query, params).fetchone() is None:
             return candidate
         candidate = f"{local}-{suffix}@{domain}"
-        suffix += 1
+    raise RuntimeError("Unable to generate a unique email address")
 
 
 def is_valid_email(value: str) -> bool:
@@ -465,7 +464,7 @@ def unique_handle(conn: sqlite3.Connection, handle: str, exclude_user_id: int | 
     if not cleaned:
         return ""
     candidate = cleaned
-    while True:
+    for _ in range(1000):
         existing = conn.execute(
             "SELECT id FROM users WHERE username=?" + (" AND id<>?" if exclude_user_id is not None else ""),
             (candidate, exclude_user_id) if exclude_user_id is not None else (candidate,),
@@ -473,6 +472,7 @@ def unique_handle(conn: sqlite3.Connection, handle: str, exclude_user_id: int | 
         if existing is None:
             return candidate
         candidate = f"{cleaned}-{secrets.randbelow(HANDLE_SUFFIX_SPAN) + HANDLE_SUFFIX_MIN}"
+    raise RuntimeError("Unable to generate a unique handle")
 
 
 def optional_http_url(value: str) -> str:
@@ -905,18 +905,21 @@ class AppHandler(BaseHTTPRequestHandler):
             if school_name:
                 school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
                 school_id = school["id"] if school else None
-            conn.execute(
-                "INSERT INTO users (username,email,password,role,name,age,school_id) VALUES (?,?,?,?,?,?,?)",
-                (
-                    username,
-                    email,
-                    hash_password(form.get("password", "")),
-                    role,
-                    form.get("name", "User").strip() or "User",
-                    to_int(form.get("age", "0"), 0) or None,
-                    school_id,
-                ),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO users (username,email,password,role,name,age,school_id) VALUES (?,?,?,?,?,?,?)",
+                    (
+                        username,
+                        email,
+                        hash_password(form.get("password", "")),
+                        role,
+                        form.get("name", "User").strip() or "User",
+                        to_int(form.get("age", "0"), 0) or None,
+                        school_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return self.respond_html(self.register_page("That email or handle is already in use."), status=400)
             if role == "athlete":
                 created = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
                 conn.execute(
@@ -1160,31 +1163,34 @@ class AppHandler(BaseHTTPRequestHandler):
             if school_name:
                 school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
                 school_id = school["id"] if school else None
-            conn.execute(
-                """
-                UPDATE users SET
-                    name=?, username=?, email=?, status_text=?, bio=?, profile_image_url=?, grade_level=?, age=?,
-                    height=?, weight=?, hometown=?, state=?, school_id=?, profile_private=?
-                WHERE id=?
-                """,
-                (
-                    form.get("name", user["name"]).strip() or user["name"],
-                    username,
-                    email,
-                    form.get("status_text", "").strip(),
-                    form.get("bio", "").strip(),
-                    optional_image_url(form.get("profile_image_url", "")),
-                    form.get("grade_level", "").strip(),
-                    to_int(form.get("age", "0"), 0) or None,
-                    form.get("height", "").strip(),
-                    form.get("weight", "").strip(),
-                    form.get("hometown", "").strip(),
-                    form.get("state", "").strip(),
-                    school_id,
-                    1 if form.get("profile_private") == "1" else 0,
-                    user["id"],
-                ),
-            )
+            try:
+                conn.execute(
+                    """
+                    UPDATE users SET
+                        name=?, username=?, email=?, status_text=?, bio=?, profile_image_url=?, grade_level=?, age=?,
+                        height=?, weight=?, hometown=?, state=?, school_id=?, profile_private=?
+                    WHERE id=?
+                    """,
+                    (
+                        form.get("name", user["name"]).strip() or user["name"],
+                        username,
+                        email,
+                        form.get("status_text", "").strip(),
+                        form.get("bio", "").strip(),
+                        optional_image_url(form.get("profile_image_url", "")),
+                        form.get("grade_level", "").strip(),
+                        to_int(form.get("age", "0"), 0) or None,
+                        form.get("height", "").strip(),
+                        form.get("weight", "").strip(),
+                        form.get("hometown", "").strip(),
+                        form.get("state", "").strip(),
+                        school_id,
+                        1 if form.get("profile_private") == "1" else 0,
+                        user["id"],
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return self.respond_html(self.my_profile(user, "That email or handle is already in use."), status=400)
         self.redirect("/profile")
 
     def add_status_update(self, user: sqlite3.Row) -> None:
@@ -1270,13 +1276,16 @@ class AppHandler(BaseHTTPRequestHandler):
             email_exists = conn.execute("SELECT id FROM users WHERE email=? AND id<>?", (admin_email, user["id"])).fetchone()
             if email_exists:
                 return self.respond_html(self.admin_page(user, "That admin email is already assigned to another account."), status=400)
-            conn.execute("UPDATE users SET email=? WHERE id=?", (admin_email, user["id"]))
-            if admin_username:
-                exists = conn.execute("SELECT id FROM users WHERE username=? AND id<>?", (admin_username, user["id"])).fetchone()
-                if not exists:
-                    conn.execute("UPDATE users SET username=? WHERE id=?", (admin_username, user["id"]))
-            if admin_password:
-                conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(admin_password), user["id"]))
+            try:
+                conn.execute("UPDATE users SET email=? WHERE id=?", (admin_email, user["id"]))
+                if admin_username:
+                    exists = conn.execute("SELECT id FROM users WHERE username=? AND id<>?", (admin_username, user["id"])).fetchone()
+                    if not exists:
+                        conn.execute("UPDATE users SET username=? WHERE id=?", (admin_username, user["id"]))
+                if admin_password:
+                    conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(admin_password), user["id"]))
+            except sqlite3.IntegrityError:
+                return self.respond_html(self.admin_page(user, "That admin email or handle is already in use."), status=400)
         self.redirect("/admin")
 
     def admin_account_action(self, user: sqlite3.Row) -> None:
@@ -1520,16 +1529,19 @@ class AppHandler(BaseHTTPRequestHandler):
             if exists:
                 return self.respond_html(self.coach_athletes(user, "That athlete email already exists."), status=400)
             username = unique_handle(conn, username)
-            conn.execute(
-                "INSERT INTO users (username,email,password,role,name) VALUES (?,?,?,?,?)",
-                (
-                    username,
-                    email,
-                    hash_password(form.get("password", "athlete123")),
-                    "athlete",
-                    form.get("name", "Athlete"),
-                ),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO users (username,email,password,role,name) VALUES (?,?,?,?,?)",
+                    (
+                        username,
+                        email,
+                        hash_password(form.get("password", "athlete123")),
+                        "athlete",
+                        form.get("name", "Athlete"),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return self.respond_html(self.coach_athletes(user, "That athlete email or handle is already in use."), status=400)
             user_id = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()["id"]
             conn.execute(
                 "INSERT INTO athletes (user_id,sex,events,group_name,coach_user_id) VALUES (?,?,?,?,?)",
