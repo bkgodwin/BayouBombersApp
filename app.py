@@ -6,6 +6,7 @@ import base64
 import html
 import hmac
 import hashlib
+import os
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
@@ -18,12 +19,18 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bayoubombers.db"
 SESSION_COOKIE = "bayou_session"
 SESSIONS: dict[str, dict[str, str]] = {}
+SESSION_TTL_SECONDS = 60 * 60 * 12
+FORCE_SECURE_COOKIE = os.getenv("BAYOU_COOKIE_SECURE", "false").lower() == "true"
 
 
 def db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def hash_password(password: str) -> str:
@@ -395,6 +402,7 @@ class AppHandler(BaseHTTPRequestHandler):
         return self.respond_html(html_page("Not Found", "<div class='card'>Route not found.</div>", user), status=404)
 
     def current_user(self) -> sqlite3.Row | None:
+        self.cleanup_sessions()
         cookie_header = self.headers.get("Cookie", "")
         jar = cookies.SimpleCookie()
         jar.load(cookie_header)
@@ -404,8 +412,22 @@ class AppHandler(BaseHTTPRequestHandler):
         session = SESSIONS.get(token.value)
         if not session:
             return None
+        created_ts = float(session.get("created_ts", "0"))
+        if utc_now().timestamp() - created_ts > SESSION_TTL_SECONDS:
+            SESSIONS.pop(token.value, None)
+            return None
         with db_conn() as conn:
             return conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+
+    def cleanup_sessions(self) -> None:
+        now_ts = utc_now().timestamp()
+        expired = [
+            token
+            for token, data in SESSIONS.items()
+            if now_ts - float(data.get("created_ts", "0")) > SESSION_TTL_SECONDS
+        ]
+        for token in expired:
+            SESSIONS.pop(token, None)
 
     def read_form(self) -> dict[str, str]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -431,8 +453,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.respond_html("", status=302, extra_headers=headers)
 
     def session_cookie_flags(self) -> str:
-        host = (self.headers.get("Host") or "").split(":")[0].lower()
-        secure = "" if host in {"127.0.0.1", "localhost"} else "; Secure"
+        secure = "; Secure" if FORCE_SECURE_COOKIE else ""
         return f"HttpOnly; Path=/; SameSite=Lax{secure}"
 
     def handle_login(self, form: dict[str, str]) -> None:
@@ -443,7 +464,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if user is None or not verify_password(password, user["password"]):
             return self.respond_html(login_page("Invalid username or password."), status=401)
         token = secrets.token_urlsafe(24)
-        SESSIONS[token] = {"user_id": str(user["id"]), "created": datetime.now(timezone.utc).isoformat()}
+        SESSIONS[token] = {"user_id": str(user["id"]), "created_ts": str(utc_now().timestamp())}
         cookie = f"{SESSION_COOKIE}={token}; {self.session_cookie_flags()}"
         self.redirect("/coach" if user["role"] == "coach" else "/athlete", cookie)
 
@@ -531,7 +552,7 @@ class AppHandler(BaseHTTPRequestHandler):
         """
         return html_page("Coach Dashboard", body, user)
 
-    def coach_athletes(self, user: sqlite3.Row) -> str:
+    def coach_athletes(self, user: sqlite3.Row, error_message: str = "") -> str:
         with db_conn() as conn:
             athletes = conn.execute(
                 """
@@ -549,7 +570,10 @@ class AppHandler(BaseHTTPRequestHandler):
             for r in athletes
         ) or "<tr><td colspan='6' class='muted'>No athletes yet.</td></tr>"
 
+        error_html = f"<div class='card'>{esc(error_message)}</div>" if error_message else ""
+
         body = f"""
+        {error_html}
         <div class='grid'>
           <div class='card'>
             <h3>Add Athlete</h3>
@@ -582,7 +606,7 @@ class AppHandler(BaseHTTPRequestHandler):
         with db_conn() as conn:
             exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
             if exists:
-                return self.respond_html(self.coach_athletes(user).replace("<main>", "<main><div class='card'>Username already exists.</div>", 1), status=400)
+                return self.respond_html(self.coach_athletes(user, "Username already exists."), status=400)
             conn.execute(
                 "INSERT INTO users (username,password,role,name) VALUES (?,?,?,?)",
                 (
@@ -607,6 +631,7 @@ class AppHandler(BaseHTTPRequestHandler):
             f"<tr><td>{m['id']}</td><td>{esc(m['name'])}</td><td>{esc(m['category'])}</td><td>{esc(m['description'])}</td></tr>"
             for m in modules
         )
+        plans_html = "".join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"
         body = f"""
         <div class='grid'>
           <div class='card'>
@@ -690,7 +715,7 @@ class AppHandler(BaseHTTPRequestHandler):
             <p class='muted'>Athlete IDs: {athlete_help}</p>
           </div>
           <div>
-            {''.join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"}
+            {plans_html}
           </div>
         </div>
         """
@@ -840,6 +865,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 f"<ul>{item_list}</ul>{complete_button}</div>"
             )
 
+        assignments_html = "".join(assignment_cards) if assignment_cards else "<div class='card'>No assignments yet.</div>"
         body = f"""
         <div class='card'>
           <h3>Welcome {esc(user['name'])}</h3>
@@ -847,7 +873,7 @@ class AppHandler(BaseHTTPRequestHandler):
         </div>
         <div class='grid' style='margin-top:12px'>
           <div>
-            {''.join(assignment_cards) if assignment_cards else "<div class='card'>No assignments yet.</div>"}
+            {assignments_html}
           </div>
           <div>
             <div class='card'>
