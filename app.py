@@ -374,6 +374,25 @@ def setting_bool(conn: sqlite3.Connection, key: str, default: bool = False) -> b
     return get_setting(conn, key, "1" if default else "0") == "1"
 
 
+def can_display_public_images(
+    target_user: sqlite3.Row,
+    current_user: sqlite3.Row | None,
+    hide_minor_images: bool,
+    is_owner: bool,
+) -> bool:
+    if not hide_minor_images:
+        return True
+    if target_user["role"] != "athlete":
+        return True
+    if (target_user["age"] or 0) >= 18:
+        return True
+    if is_owner:
+        return True
+    if current_user and current_user["is_admin"]:
+        return True
+    return False
+
+
 def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
     primary = "#2563eb"
     secondary = "#0f172a"
@@ -752,9 +771,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if term and term not in haystack:
                 continue
             avatar = row["profile_image_url"] or "/static/default-avatar.svg"
-            if hide_minor_images and row["role"] == "athlete" and (row["age"] or 0) < 18:
-                if not current_user or (current_user["id"] != row["id"] and not current_user["is_admin"]):
-                    avatar = "/static/default-avatar.svg"
+            is_owner = bool(current_user and current_user["id"] == row["id"])
+            if not can_display_public_images(row, current_user, hide_minor_images, is_owner):
+                avatar = "/static/default-avatar.svg"
             cards.append(
                 f"<a class='card profile-link' href='/profile/{row['id']}'>"
                 f"<div class='profile-head'><img class='avatar' src='{esc(avatar)}' alt='avatar'>"
@@ -786,7 +805,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return html_page("Private Profile", "<div class='card'>This profile is private.</div>", current_user)
             photos = conn.execute("SELECT image_url, caption FROM galleries WHERE user_id=? ORDER BY id DESC", (target["id"],)).fetchall()
             hide_minor_images = setting_bool(conn, "hide_minor_images_public", True)
-        can_show_images = not (hide_minor_images and target["role"] == "athlete" and (target["age"] or 0) < 18 and not (current_user and current_user["is_admin"]) and not is_owner)
+        can_show_images = can_display_public_images(target, current_user, hide_minor_images, is_owner)
         profile_img = target["profile_image_url"] if can_show_images and target["profile_image_url"] else "/static/default-avatar.svg"
         school_symbol = f"<img class='school-symbol' src='{esc(target['symbol_url'])}' alt='school symbol'>" if target["symbol_url"] else ""
         gallery_html = (
@@ -911,7 +930,8 @@ class AppHandler(BaseHTTPRequestHandler):
     def add_gallery_photo(self, user: sqlite3.Row) -> None:
         form = self.read_form()
         image_url = form.get("image_url", "").strip()
-        if not (image_url.startswith("http://") or image_url.startswith("https://")):
+        parsed = urlparse(image_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return self.redirect("/profile")
         with db_conn() as conn:
             conn.execute(
@@ -954,6 +974,7 @@ class AppHandler(BaseHTTPRequestHandler):
           </div>
           <div class='card'>
             <h2>All Accounts</h2>
+            <p class='muted'>Password reset sets a temporary password of <strong>Reset123!</strong>; share it securely and require user to update afterward.</p>
             <table><tr><th>ID</th><th>Name</th><th>Username</th><th>Role</th><th>Locked</th><th>Actions</th></tr>{account_rows}</table>
           </div>
         </div>
