@@ -432,8 +432,8 @@ def next_available_email(conn: sqlite3.Connection, seed: str, exclude_user_id: i
     local_part, _, domain_part = seed.partition("@")
     local = slugify_text(local_part or "member")
     domain = re.sub(r"[^a-z0-9.-]+", "", domain_part.lower()).strip(".") or "bayoubombers.app"
-    candidate = f"{local}@{domain}"
-    for suffix in range(2, 1002):
+    for suffix in range(0, 1000):
+        candidate = f"{local}@{domain}" if suffix == 0 else f"{local}-{suffix}@{domain}"
         params: tuple[object, ...]
         query = "SELECT id FROM users WHERE email=?"
         if exclude_user_id is None:
@@ -443,7 +443,6 @@ def next_available_email(conn: sqlite3.Connection, seed: str, exclude_user_id: i
             params = (candidate, exclude_user_id)
         if conn.execute(query, params).fetchone() is None:
             return candidate
-        candidate = f"{local}-{suffix}@{domain}"
     raise RuntimeError("Unable to generate a unique email address")
 
 
@@ -473,6 +472,11 @@ def unique_handle(conn: sqlite3.Connection, handle: str, exclude_user_id: int | 
             return candidate
         candidate = f"{cleaned}-{secrets.randbelow(HANDLE_SUFFIX_SPAN) + HANDLE_SUFFIX_MIN}"
     raise RuntimeError("Unable to generate a unique handle")
+
+
+def default_handle_from_email(email: str) -> str:
+    local_part = email.split("@", 1)[0]
+    return slugify_text(local_part)
 
 
 def optional_http_url(value: str) -> str:
@@ -890,7 +894,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if not setting_bool(conn, "registration_open", True):
                 return self.respond_html(html_page("Registration Closed", "<div class='card'>Registration is disabled.</div>"), status=403)
             email = normalize_email(form.get("email", ""))
-            username = form.get("username", "").strip() or email.split("@", 1)[0]
+            username = form.get("username", "").strip() or default_handle_from_email(email)
             role = form.get("role", "athlete")
             if role not in {"coach", "athlete"}:
                 role = "athlete"
@@ -1521,7 +1525,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def add_athlete(self, user: sqlite3.Row) -> None:
         form = self.read_form()
         email = normalize_email(form.get("email", ""))
-        username = form.get("username", "").strip() or email.split("@", 1)[0]
+        username = form.get("username", "").strip() or default_handle_from_email(email)
         if not is_valid_email(email):
             return self.respond_html(self.coach_athletes(user, "Enter a valid athlete email address."), status=400)
         with db_conn() as conn:
