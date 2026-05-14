@@ -42,8 +42,20 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     });
 
-    form.addEventListener('submit', () => {
-      athleteIdsInput.value = athleteCheckboxes.filter((item) => item.checked).map((item) => item.value).join(',');
+    form.addEventListener('submit', (event) => {
+      const selectedIds = athleteCheckboxes.filter((item) => item.checked).map((item) => item.value);
+      athleteIdsInput.value = selectedIds.join(',');
+      if (!selectedIds.length) {
+        event.preventDefault();
+        const submitBtn = form.querySelector('button[type="submit"]');
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          if (submitBtn.dataset.original) {
+            submitBtn.textContent = submitBtn.dataset.original;
+          }
+        }
+        window.alert('Select at least one athlete before assigning this plan.');
+      }
     });
   });
 });

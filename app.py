@@ -814,7 +814,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.add_module(user)
 
         if path == "/coach/plans" and method == "GET":
-            return self.respond_html(self.coach_plans(user))
+            return self.respond_html(self.coach_plans(user, query.get("msg", [""])[0]))
 
         if path == "/coach/plans" and method == "POST":
             return self.add_plan(user)
@@ -1928,10 +1928,13 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         self.redirect("/coach/modules")
 
-    def coach_plans(self, user: sqlite3.Row) -> str:
+    def coach_plans(self, user: sqlite3.Row, message: str = "") -> str:
         with db_conn() as conn:
             modules = conn.execute("SELECT id,name,category FROM training_modules ORDER BY name").fetchall()
-            plans = conn.execute("SELECT * FROM practice_plans WHERE created_by=? ORDER BY practice_date DESC, id DESC", (user["id"],)).fetchall()
+            plans = conn.execute(
+                "SELECT id,title,practice_date,notes,created_by FROM practice_plans WHERE created_by=? ORDER BY practice_date DESC, id DESC",
+                (user["id"],),
+            ).fetchall()
             athletes = conn.execute(
                 "SELECT a.id, COALESCE(u.name, 'Athlete #' || a.id) AS athlete_name FROM athletes a LEFT JOIN users u ON u.id=a.user_id WHERE a.coach_user_id=? ORDER BY athlete_name",
                 (user["id"],),
@@ -1986,8 +1989,10 @@ class AppHandler(BaseHTTPRequestHandler):
         )
         athlete_help = ", ".join(esc(a["athlete_name"]) for a in athletes) or "No athletes found"
         plans_html = "".join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"
+        message_html = f"<div class='notice card'>{esc(message)}</div>" if message else ""
 
         body = f"""
+        {message_html}
         <div class='grid plan-layout'>
           <div class='card school-accent'>
             <h3>Create Practice Plan</h3>
@@ -2039,12 +2044,12 @@ class AppHandler(BaseHTTPRequestHandler):
         athlete_ids_raw = form.get("athlete_ids", "")
         athlete_ids = [to_int(x, -1) for x in athlete_ids_raw.split(",") if x.strip()]
         if not athlete_ids or plan_id < 1:
-            self.redirect("/coach/plans")
+            self.redirect("/coach/plans?msg=Please+select+at+least+one+athlete+to+assign.")
             return
         with db_conn() as conn:
             plan = conn.execute("SELECT id FROM practice_plans WHERE id=? AND created_by=?", (plan_id, user["id"])).fetchone()
             if plan is None:
-                return self.redirect("/coach/plans")
+                return self.redirect("/coach/plans?msg=That+practice+plan+could+not+be+assigned.")
             for athlete_id in athlete_ids:
                 if athlete_id < 1:
                     continue
@@ -2060,7 +2065,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "INSERT INTO assignments (plan_id,athlete_id,status,assigned_on) VALUES (?,?,?,?)",
                         (plan_id, athlete_id, "assigned", date.today().isoformat()),
                     )
-        self.redirect("/coach/plans")
+        self.redirect("/coach/plans?msg=Plan+assigned+to+selected+athletes.")
 
     def coach_reports(self, user: sqlite3.Row) -> str:
         since = (date.today() - timedelta(days=7)).isoformat()
