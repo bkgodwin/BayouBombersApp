@@ -13,9 +13,12 @@ Then open `http://127.0.0.1:8000`.
 
 ## Home Experience
 
-- Home page now shows About content and entry links (Login, Search, Register).
+- Home page now shows a full-cover hero using the admin-managed background image and modern top navigation.
+- Clicking the Bayou Bombers site name in the top bar always returns to the home page.
 - Public search supports coach/athlete profile discovery with privacy filtering.
 - Admin can update About text, home cover image, and account creation policy.
+- Accounts sign in with email, while optional handles remain available for public profiles.
+- Public profiles include gallery photos plus a status feed, and signed-in users can manage profile details from their profile tools.
 
 ## Included MVP Areas
 
