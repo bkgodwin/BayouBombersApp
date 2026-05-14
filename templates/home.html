@@ -1,10 +1,11 @@
-<section class='hero' style="--cover:url('{{cover_url}}')">
-  <div class='card'>
-    <h2>Bayou Bombers</h2>
+<section class='hero home-hero' style="--cover:url('{{cover_url}}')">
+  <div class='hero-panel'>
+    {{welcome_badge}}
+    <h1>Bayou Bombers</h1>
     <p>{{about_text}}</p>
     <div class='inline'>
-      <a class='btn' href='/login'>Login</a>
-      <a class='btn secondary' href='/search'>Search Public Profiles</a>
+      <a class='btn' href='{{primary_cta_url}}'>{{primary_cta_text}}</a>
+      <a class='btn secondary' href='{{secondary_cta_url}}'>{{secondary_cta_text}}</a>
       <a class='btn secondary' href='/register'>Create Account</a>
     </div>
   </div>

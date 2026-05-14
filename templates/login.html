@@ -1,17 +1,19 @@
-<div class='grid'>
+<div class='grid login-shell'>
   <div class='card'>
-    <h2>Login</h2>
+    <h2>Sign In</h2>
+    <p class='muted'>Use your account email and password.</p>
     <form method='post' action='/login'>
-      <label>Username<input name='username' required></label>
+      <label>Email<input type='email' name='email' required></label>
       <label>Password<input type='password' name='password' required></label>
       <button type='submit'>Sign In</button>
     </form>
   </div>
   <div class='card'>
-    <h3>About</h3>
-    <p>Sign in to manage training, profiles, and team operations.</p>
-    <p class='muted'>Search lets visitors find public athlete and coach profiles.</p>
+    <h3>Community Access</h3>
+    <p>Reach training dashboards, public profiles, galleries, and status updates from one modern hub.</p>
+    <p class='muted'>Visitors can browse public profiles, and members can jump back home from the site name in the top bar.</p>
     <div class='inline'>
+      <a class='btn secondary' href='/'>Home</a>
       <a class='btn secondary' href='/search'>Search Public Profiles</a>
       <a class='btn secondary' href='/register'>Create Account</a>
     </div>
