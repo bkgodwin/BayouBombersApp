@@ -8,7 +8,7 @@ import hmac
 import hashlib
 import secrets
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -310,6 +310,10 @@ def to_float(value: str, default: float = 0.0) -> float:
         return default
 
 
+def clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(min(value, maximum), minimum)
+
+
 class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.route("GET")
@@ -434,7 +438,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if user is None or not verify_password(password, user["password"]):
             return self.respond_html(login_page("Invalid username or password."), status=401)
         token = secrets.token_urlsafe(24)
-        SESSIONS[token] = {"user_id": str(user["id"]), "created": datetime.utcnow().isoformat()}
+        SESSIONS[token] = {"user_id": str(user["id"]), "created": datetime.now(timezone.utc).isoformat()}
         cookie = f"{SESSION_COOKIE}={token}; HttpOnly; Path=/; SameSite=Lax"
         self.redirect("/coach" if user["role"] == "coach" else "/athlete", cookie)
 
@@ -889,7 +893,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.redirect("/athlete")
         form = self.read_form()
         feet = max(to_int(form.get("feet", "0"), 0), 0)
-        inches = max(min(to_int(form.get("inches", "0"), 0), 11), 0)
+        inches = clamp(to_int(form.get("inches", "0"), 0), 0, 11)
         total_inches, meters = feet_inches_to_metrics(feet, inches)
         with db_conn() as conn:
             conn.execute(
@@ -922,7 +926,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.redirect("/athlete")
         form = self.read_form()
         feet = max(to_int(form.get("feet", "0"), 0), 0)
-        inches = max(min(to_int(form.get("inches", "0"), 0), 11), 0)
+        inches = clamp(to_int(form.get("inches", "0"), 0), 0, 11)
         total_inches, meters = feet_inches_to_metrics(feet, inches)
         event = form.get("event", "Shot Put")
         with db_conn() as conn:
