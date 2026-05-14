@@ -28,17 +28,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // Coach plan assignment select-all controls
   document.querySelectorAll('form[action="/coach/assign"]').forEach((form) => {
     const selectAll = form.querySelector('.plan-select-all');
-    const checks = Array.from(form.querySelectorAll('input[type="checkbox"][name="athlete_ids"]'));
-    if (!selectAll || !checks.length) return;
+    const athleteCheckboxes = Array.from(form.querySelectorAll('.plan-athlete-choice'));
+    const athleteIdsInput = form.querySelector('input[name="athlete_ids"]');
+    if (!selectAll || !athleteCheckboxes.length || !athleteIdsInput) return;
 
     selectAll.addEventListener('change', () => {
-      checks.forEach((check) => { check.checked = selectAll.checked; });
+      athleteCheckboxes.forEach((check) => { check.checked = selectAll.checked; });
     });
 
-    checks.forEach((check) => {
+    athleteCheckboxes.forEach((check) => {
       check.addEventListener('change', () => {
-        selectAll.checked = checks.every((item) => item.checked);
+        selectAll.checked = athleteCheckboxes.every((item) => item.checked);
       });
+    });
+
+    form.addEventListener('submit', () => {
+      athleteIdsInput.value = athleteCheckboxes.filter((item) => item.checked).map((item) => item.value).join(',');
     });
   });
 });

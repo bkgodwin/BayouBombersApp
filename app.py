@@ -888,7 +888,7 @@ class AppHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         if "multipart/form-data" in content_type:
             return parse_multipart(content_type, raw)
-        fields = {k: ",".join(v) if len(v) > 1 else v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+        fields = {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
         return fields, {}
 
     def read_form(self) -> dict[str, str]:
@@ -1731,8 +1731,6 @@ class AppHandler(BaseHTTPRequestHandler):
           <div class='card'>
             <h3>Create New Athlete Account</h3>
             <form method='post' action='/coach/athletes' autocomplete='off'>
-              <input type='text' name='prevent_autofill_username' autocomplete='username' style='display:none'>
-              <input type='password' name='prevent_autofill_password' autocomplete='current-password' style='display:none'>
               <label>Name<input name='name' required></label>
               <div class='row'>
                 <label>Email<input type='email' name='email' autocomplete='off' autocapitalize='off' spellcheck='false' required></label>
@@ -1967,7 +1965,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 ).fetchall()
                 assigned_tags = "".join(f"<span class='tag'>{esc(a['athlete_name'])}</span>" for a in assigned_athletes) or "<span class='muted'>No athletes assigned yet.</span>"
                 athlete_checks = "".join(
-                    f"<label class='checkbox-row plan-checkbox'><input type='checkbox' name='athlete_ids' value='{a['id']}'><span>{esc(a['athlete_name'])}</span></label>"
+                    f"<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-athlete-choice' value='{a['id']}'><span>{esc(a['athlete_name'])}</span></label>"
                     for a in athletes
                 ) or "<p class='muted'>Add athletes to your roster before assigning plans.</p>"
                 plan_cards.append(
@@ -1975,7 +1973,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     f"<p>{esc(p['notes'] or 'No plan-level notes.')}</p>"
                     f"<h5>Modules</h5><ul>{item_list}</ul>"
                     f"<h5>Assigned Athletes</h5><div class='tag-wrap'>{assigned_tags}</div>"
-                    f"<form method='post' action='/coach/assign'><input type='hidden' name='plan_id' value='{p['id']}'>"
+                    f"<form method='post' action='/coach/assign'><input type='hidden' name='plan_id' value='{p['id']}'><input type='hidden' name='athlete_ids' value=''>"
                     "<div class='plan-select-tools'>"
                     "<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-select-all'><span>Select all athletes</span></label>"
                     "</div>"
