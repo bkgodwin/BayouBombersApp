@@ -6,14 +6,16 @@ import base64
 import html
 import hmac
 import hashlib
+import mimetypes
 import os
+import re
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, unquote
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "bayoubombers.db"
@@ -21,6 +23,8 @@ SESSION_COOKIE = "bayou_session"
 SESSIONS: dict[str, dict[str, str]] = {}
 SESSION_TTL_SECONDS = 60 * 60 * 12
 FORCE_SECURE_COOKIE = os.getenv("BAYOU_COOKIE_SECURE", "false").lower() == "true"
+STATIC_DIR = BASE_DIR / "static"
+TEMPLATES_DIR = BASE_DIR / "templates"
 
 
 def db_conn() -> sqlite3.Connection:
@@ -212,8 +216,57 @@ def init_db() -> None:
                 achieved_on TEXT NOT NULL,
                 FOREIGN KEY(athlete_id) REFERENCES athletes(id)
             );
+
+            CREATE TABLE IF NOT EXISTS schools (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coach_user_id INTEGER NOT NULL,
+                name TEXT UNIQUE NOT NULL,
+                color_primary TEXT NOT NULL DEFAULT '#2563eb',
+                color_secondary TEXT NOT NULL DEFAULT '#0f172a',
+                symbol_url TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(coach_user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS galleries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                image_url TEXT NOT NULL,
+                caption TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS site_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
+
+        ensure_column(conn, "users", "is_admin", "INTEGER", "0")
+        ensure_column(conn, "users", "locked", "INTEGER", "0")
+        ensure_column(conn, "users", "profile_private", "INTEGER", "0")
+        ensure_column(conn, "users", "force_private", "INTEGER", "0")
+        ensure_column(conn, "users", "school_id", "INTEGER")
+        ensure_column(conn, "users", "bio", "TEXT", "''")
+        ensure_column(conn, "users", "status_text", "TEXT", "''")
+        ensure_column(conn, "users", "grade_level", "TEXT", "''")
+        ensure_column(conn, "users", "age", "INTEGER")
+        ensure_column(conn, "users", "height", "TEXT", "''")
+        ensure_column(conn, "users", "weight", "TEXT", "''")
+        ensure_column(conn, "users", "hometown", "TEXT", "''")
+        ensure_column(conn, "users", "state", "TEXT", "''")
+        ensure_column(conn, "users", "profile_image_url", "TEXT", "''")
+        ensure_column(conn, "athletes", "coach_user_id", "INTEGER")
+
+        set_setting(
+            conn,
+            "about_text",
+            get_setting(conn, "about_text", "Bayou Bombers is a modern throws training platform for athletes and coaches."),
+        )
+        set_setting(conn, "home_cover_url", get_setting(conn, "home_cover_url", ""))
+        set_setting(conn, "registration_open", get_setting(conn, "registration_open", "1"))
+        set_setting(conn, "hide_minor_images_public", get_setting(conn, "hide_minor_images_public", "1"))
 
         coach = conn.execute("SELECT id FROM users WHERE username='coach'").fetchone()
         if coach is None:
@@ -227,6 +280,10 @@ def init_db() -> None:
                 "INSERT INTO users (username, password, role, name) VALUES (?,?,?,?)",
                 ("admin@admin.com", hash_password("password123"), "coach", "Admin Coach"),
             )
+            admin = conn.execute("SELECT id FROM users WHERE username='admin@admin.com'").fetchone()
+        if admin is None:
+            raise RuntimeError("Failed to initialize admin account")
+        conn.execute("UPDATE users SET is_admin=1 WHERE id=?", (admin["id"],))
 
         athlete_user = conn.execute("SELECT id FROM users WHERE username='athlete' ").fetchone()
         if athlete_user is None:
@@ -239,8 +296,8 @@ def init_db() -> None:
         existing_athlete = conn.execute("SELECT id FROM athletes WHERE user_id=?", (athlete_user["id"],)).fetchone()
         if existing_athlete is None:
             conn.execute(
-                "INSERT INTO athletes (user_id, sex, events, group_name) VALUES (?,?,?,?)",
-                (athlete_user["id"], "Male", "Shot Put,Discus", "Varsity Throws"),
+                "INSERT INTO athletes (user_id, sex, events, group_name, coach_user_id) VALUES (?,?,?,?,?)",
+                (athlete_user["id"], "Male", "Shot Put,Discus", "Varsity Throws", coach["id"]),
             )
 
         module_count = conn.execute("SELECT COUNT(*) AS c FROM training_modules").fetchone()["c"]
@@ -260,19 +317,113 @@ def esc(value: object) -> str:
     return html.escape(str(value))
 
 
+def read_template(name: str) -> str:
+    path = TEMPLATES_DIR / name
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    allowed_tables = {
+        "users",
+        "athletes",
+        "training_modules",
+        "practice_plans",
+        "practice_plan_items",
+        "assignments",
+        "throw_logs",
+        "lift_logs",
+        "meet_results",
+        "prs",
+        "schools",
+        "galleries",
+        "site_settings",
+    }
+    if table not in allowed_tables:
+        raise ValueError("Unsupported table name")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
+        raise ValueError("Invalid column name")
+    # Safe interpolation: table is strictly allowlisted above and cannot be user-controlled.
+    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(c["name"] == column for c in cols)
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str, default_sql: str = "") -> None:
+    if table not in {"users", "athletes"}:
+        raise ValueError("Unsupported table for schema alteration")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
+        raise ValueError("Invalid column name")
+    if sql_type not in {"INTEGER", "TEXT", "REAL"}:
+        raise ValueError("Unsupported SQL type")
+    if not column_exists(conn, table, column):
+        default_part = f" DEFAULT {default_sql}" if default_sql else ""
+        # Safe interpolation: table/column/sql_type are validated to strict allowlists/patterns.
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}{default_part}")
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM site_settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def setting_bool(conn: sqlite3.Connection, key: str, default: bool = False) -> bool:
+    return get_setting(conn, key, "1" if default else "0") == "1"
+
+
+def can_display_public_images(
+    target_user: sqlite3.Row,
+    current_user: sqlite3.Row | None,
+    hide_minor_images: bool,
+    is_owner: bool,
+) -> bool:
+    if not hide_minor_images:
+        return True
+    if target_user["role"] != "athlete":
+        return True
+    if (target_user["age"] or 0) >= 18:
+        return True
+    if is_owner:
+        return True
+    if current_user and current_user["is_admin"]:
+        return True
+    return False
+
+
 def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
+    primary = "#2563eb"
+    secondary = "#0f172a"
+    if user and user["school_id"]:
+        with db_conn() as conn:
+            school = conn.execute("SELECT color_primary,color_secondary FROM schools WHERE id=?", (user["school_id"],)).fetchone()
+            if school:
+                primary = school["color_primary"] or primary
+                secondary = school["color_secondary"] or secondary
     nav = ""
     if user:
-        if user["role"] == "coach":
+        if user["is_admin"]:
+            nav = (
+                "<a href='/admin'>Admin</a><a href='/search'>Search</a>"
+                "<a href='/profile'>My Profile</a><a href='/logout'>Logout</a>"
+            )
+        elif user["role"] == "coach":
             nav = (
                 "<a href='/coach'>Dashboard</a><a href='/coach/athletes'>Athletes</a>"
                 "<a href='/coach/modules'>Modules</a><a href='/coach/plans'>Plans</a>"
-                "<a href='/coach/reports'>Reports</a><a href='/logout'>Logout</a>"
+                "<a href='/coach/reports'>Reports</a><a href='/coach/schools'>Schools</a>"
+                "<a href='/search'>Search</a><a href='/profile'>My Profile</a><a href='/logout'>Logout</a>"
             )
         else:
             nav = (
                 "<a href='/athlete'>Today</a><a href='/athlete/progress'>Progress</a>"
-                "<a href='/logout'>Logout</a>"
+                "<a href='/search'>Search</a><a href='/profile'>My Profile</a><a href='/logout'>Logout</a>"
             )
     return f"""<!doctype html>
 <html>
@@ -280,24 +431,12 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
   <meta charset='utf-8'>
   <meta name='viewport' content='width=device-width, initial-scale=1'>
   <title>{esc(title)}</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 0; background:#f5f7fa; color:#1f2937; }}
-    header {{ background:#0f172a; color:#fff; padding:16px; }}
-    nav a {{ color:#bfdbfe; margin-right:12px; text-decoration:none; font-weight:600; }}
-    main {{ padding:16px; max-width:1100px; margin:0 auto; }}
-    .grid {{ display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); }}
-    .card {{ background:#fff; border-radius:12px; padding:14px; box-shadow:0 2px 8px rgba(15,23,42,.08); }}
-    .muted {{ color:#6b7280; font-size:.92rem; }}
-    table {{ width:100%; border-collapse:collapse; font-size:.95rem; }}
-    th,td {{ border-bottom:1px solid #e5e7eb; padding:8px; text-align:left; }}
-    input,select,button,textarea {{ width:100%; padding:8px; border:1px solid #cbd5e1; border-radius:8px; margin-top:4px; }}
-    button {{ background:#2563eb; color:#fff; font-weight:700; cursor:pointer; }}
-    .row {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
-    .tag {{ display:inline-block; background:#e2e8f0; border-radius:999px; padding:4px 10px; margin:2px; font-size:.85rem; }}
-  </style>
+  <style>:root{{--school-primary:{esc(primary)};--school-secondary:{esc(secondary)};}}</style>
+  <link rel='stylesheet' href='/static/master.css'>
+  <script src='/static/app.js' defer></script>
 </head>
 <body>
-  <header><strong>Bayou Bombers Throws App</strong><div style='margin-top:8px'>{nav}</div></header>
+  <header class='site-header'><strong>Bayou Bombers Throws App</strong><div style='margin-top:8px'>{nav}</div></header>
   <main>{body}</main>
 </body>
 </html>"""
@@ -331,16 +470,37 @@ class AppHandler(BaseHTTPRequestHandler):
     def route(self, method: str) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        query = parse_qs(parsed.query)
         user = self.current_user()
+
+        if path.startswith("/static/") and method == "GET":
+            return self.serve_static(path)
 
         if path == "/":
             if user is None:
-                return self.respond_html(login_page())
+                return self.respond_html(home_page())
+            if user["is_admin"]:
+                return self.redirect("/admin")
             return self.redirect("/coach" if user["role"] == "coach" else "/athlete")
+
+        if path == "/login" and method == "GET":
+            return self.respond_html(login_page())
 
         if path == "/login" and method == "POST":
             form = self.read_form()
             return self.handle_login(form)
+
+        if path == "/register" and method == "GET":
+            return self.respond_html(self.register_page())
+
+        if path == "/register" and method == "POST":
+            return self.handle_register()
+
+        if path == "/search" and method == "GET":
+            return self.respond_html(self.search_profiles(query.get("q", [""])[0], user))
+
+        if path.startswith("/profile/") and method == "GET":
+            return self.respond_html(self.public_profile(path, user))
 
         if path == "/logout":
             return self.handle_logout()
@@ -348,11 +508,44 @@ class AppHandler(BaseHTTPRequestHandler):
         if user is None:
             return self.respond_html(login_page("Please log in first."), status=401)
 
+        if user["locked"]:
+            return self.respond_html(login_page("Your account is locked. Contact admin."), status=403)
+
         if path.startswith("/coach") and user["role"] != "coach":
             return self.respond_html(html_page("Unauthorized", "<div class='card'>Coach access only.</div>", user), status=403)
 
         if path.startswith("/athlete") and user["role"] != "athlete":
             return self.respond_html(html_page("Unauthorized", "<div class='card'>Athlete access only.</div>", user), status=403)
+
+        if user["is_admin"] and path == "/admin" and method == "GET":
+            return self.respond_html(self.admin_page(user))
+
+        if user["is_admin"] and path == "/admin/settings" and method == "POST":
+            return self.update_admin_settings(user)
+
+        if user["is_admin"] and path == "/admin/account-action" and method == "POST":
+            return self.admin_account_action(user)
+
+        if path == "/profile" and method == "GET":
+            return self.respond_html(self.my_profile(user))
+
+        if path == "/profile" and method == "POST":
+            return self.update_profile(user)
+
+        if path == "/profile/gallery" and method == "POST":
+            return self.add_gallery_photo(user)
+
+        if path == "/coach/schools" and method == "GET":
+            return self.respond_html(self.coach_schools(user))
+
+        if path == "/coach/schools" and method == "POST":
+            return self.add_school(user)
+
+        if path == "/coach/athlete/privacy" and method == "POST":
+            return self.coach_athlete_privacy(user)
+
+        if path == "/coach/athlete/school" and method == "POST":
+            return self.coach_athlete_school(user)
 
         if path == "/coach":
             return self.respond_html(self.coach_dashboard(user))
@@ -452,6 +645,21 @@ class AppHandler(BaseHTTPRequestHandler):
             headers["Set-Cookie"] = cookie_header
         self.respond_html("", status=302, extra_headers=headers)
 
+    def respond_bytes(self, payload: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_static(self, path: str) -> None:
+        rel = path.removeprefix("/static/")
+        target = (STATIC_DIR / rel).resolve()
+        if not str(target).startswith(str(STATIC_DIR.resolve())) or not target.exists() or not target.is_file():
+            return self.respond_html("Not Found", status=404)
+        mime = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        self.respond_bytes(target.read_bytes(), mime)
+
     def session_cookie_flags(self) -> str:
         secure = "; Secure" if FORCE_SECURE_COOKIE else ""
         return f"HttpOnly; Path=/; SameSite=Lax{secure}"
@@ -463,10 +671,77 @@ class AppHandler(BaseHTTPRequestHandler):
             user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
         if user is None or not verify_password(password, user["password"]):
             return self.respond_html(login_page("Invalid username or password."), status=401)
+        if user["locked"]:
+            return self.respond_html(login_page("Your account is locked."), status=403)
         token = secrets.token_urlsafe(24)
         SESSIONS[token] = {"user_id": str(user["id"]), "created_ts": str(utc_now().timestamp())}
         cookie = f"{SESSION_COOKIE}={token}; {self.session_cookie_flags()}"
+        if user["is_admin"]:
+            return self.redirect("/admin", cookie)
         self.redirect("/coach" if user["role"] == "coach" else "/athlete", cookie)
+
+    def register_page(self) -> str:
+        with db_conn() as conn:
+            if not setting_bool(conn, "registration_open", True):
+                return html_page("Registration Closed", "<div class='card'>New account creation is currently disabled.</div>")
+            schools = conn.execute("SELECT name FROM schools ORDER BY name").fetchall()
+        school_options = "".join(f"<option value='{esc(s['name'])}'></option>" for s in schools)
+        body = f"""
+        <div class='card'>
+          <h2>Create Account</h2>
+          <form method='post' action='/register'>
+            <label>Name<input name='name' required></label>
+            <label>Username / Email<input name='username' required></label>
+            <label>Password<input type='password' name='password' required></label>
+            <div class='row'>
+              <label>Role<select name='role'><option value='athlete'>Athlete</option><option value='coach'>Coach</option></select></label>
+              <label>Age<input type='number' min='1' max='99' name='age'></label>
+            </div>
+            <label>School<input list='schools' name='school_name' placeholder='Coach-defined school'></label>
+            <datalist id='schools'>{school_options}</datalist>
+            <button type='submit'>Create Account</button>
+          </form>
+        </div>
+        """
+        return html_page("Register", body)
+
+    def handle_register(self) -> None:
+        form = self.read_form()
+        with db_conn() as conn:
+            if not setting_bool(conn, "registration_open", True):
+                return self.respond_html(html_page("Registration Closed", "<div class='card'>Registration is disabled.</div>"), status=403)
+            username = form.get("username", "").strip()
+            role = form.get("role", "athlete")
+            if role not in {"coach", "athlete"}:
+                role = "athlete"
+            if not username:
+                return self.respond_html(self.register_page(), status=400)
+            exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+            if exists:
+                return self.respond_html(html_page("Register", "<div class='card'>Username already exists.</div>"), status=400)
+            school_id = None
+            school_name = form.get("school_name", "").strip()
+            if school_name:
+                school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
+                school_id = school["id"] if school else None
+            conn.execute(
+                "INSERT INTO users (username,password,role,name,age,school_id) VALUES (?,?,?,?,?,?)",
+                (
+                    username,
+                    hash_password(form.get("password", "")),
+                    role,
+                    form.get("name", "User").strip() or "User",
+                    to_int(form.get("age", "0"), 0) or None,
+                    school_id,
+                ),
+            )
+            if role == "athlete":
+                created = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+                conn.execute(
+                    "INSERT INTO athletes (user_id,sex,events,group_name) VALUES (?,?,?,?)",
+                    (created["id"], "Unspecified", "Shot Put", ""),
+                )
+        self.redirect("/login")
 
     def handle_logout(self) -> None:
         cookie_header = self.headers.get("Cookie", "")
@@ -477,6 +752,350 @@ class AppHandler(BaseHTTPRequestHandler):
             SESSIONS.pop(token.value, None)
         expired = f"{SESSION_COOKIE}=deleted; Path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT"
         self.redirect("/", expired)
+
+    def search_profiles(self, q: str, current_user: sqlite3.Row | None) -> str:
+        term = q.strip().lower()
+        with db_conn() as conn:
+            users = conn.execute(
+                """
+                SELECT u.*, COALESCE(s.name,'') AS school_name
+                FROM users u
+                LEFT JOIN schools s ON s.id=u.school_id
+                WHERE u.role IN ('coach','athlete') AND u.is_admin=0 AND u.locked=0
+                ORDER BY u.name
+                """
+            ).fetchall()
+            hide_minor_images = setting_bool(conn, "hide_minor_images_public", True)
+        cards = []
+        for row in users:
+            if row["profile_private"] or row["force_private"]:
+                if not current_user or (current_user["id"] != row["id"] and not current_user["is_admin"]):
+                    continue
+            haystack = f"{(row['name'] or '').lower()} {(row['username'] or '').lower()}"
+            if term and term not in haystack:
+                continue
+            avatar = row["profile_image_url"] or "/static/default-avatar.svg"
+            is_owner = bool(current_user and current_user["id"] == row["id"])
+            if not can_display_public_images(row, current_user, hide_minor_images, is_owner):
+                avatar = "/static/default-avatar.svg"
+            cards.append(
+                f"<a class='card profile-link' href='/profile/{row['id']}'>"
+                f"<div class='profile-head'><img class='avatar' src='{esc(avatar)}' alt='avatar'>"
+                f"<div><h3>{esc(row['name'])}</h3><p class='muted'>{esc(row['role'])} {esc(row['school_name'])}</p></div></div></a>"
+            )
+        cards_html = "".join(cards) or "<div class='card'>No profiles found.</div>"
+        body = (
+            "<div class='card'><h2>Search Coaches & Athletes</h2>"
+            "<form method='get' action='/search'><div class='inline'>"
+            f"<input name='q' value='{esc(q)}' placeholder='Search by name or username'>"
+            "<button type='submit'>Search</button></div></form>"
+            "<p class='muted'>Private profiles are hidden from search and viewing.</p></div>"
+            f"<div class='grid' style='margin-top:12px'>{cards_html}</div>"
+        )
+        return html_page("Search", body, current_user)
+
+    def public_profile(self, path: str, current_user: sqlite3.Row | None) -> str:
+        user_id = to_int(unquote(path.split("/")[-1]), 0)
+        with db_conn() as conn:
+            target = conn.execute(
+                "SELECT u.*, COALESCE(s.name,'') AS school_name, s.color_primary, s.color_secondary, s.symbol_url "
+                "FROM users u LEFT JOIN schools s ON s.id=u.school_id WHERE u.id=?",
+                (user_id,),
+            ).fetchone()
+            if target is None or target["is_admin"] or target["locked"]:
+                return html_page("Not Found", "<div class='card'>Profile not found.</div>", current_user)
+            is_owner = bool(current_user and current_user["id"] == target["id"])
+            if (target["profile_private"] or target["force_private"]) and not is_owner and not (current_user and current_user["is_admin"]):
+                return html_page("Private Profile", "<div class='card'>This profile is private.</div>", current_user)
+            photos = conn.execute("SELECT image_url, caption FROM galleries WHERE user_id=? ORDER BY id DESC", (target["id"],)).fetchall()
+            hide_minor_images = setting_bool(conn, "hide_minor_images_public", True)
+        can_show_images = can_display_public_images(target, current_user, hide_minor_images, is_owner)
+        profile_img = target["profile_image_url"] if can_show_images and target["profile_image_url"] else "/static/default-avatar.svg"
+        school_symbol = f"<img class='school-symbol' src='{esc(target['symbol_url'])}' alt='school symbol'>" if target["symbol_url"] else ""
+        gallery_html = (
+            "".join(
+                f"<figure class='gallery-item'><img src='{esc(p['image_url'])}' alt='gallery image'><figcaption>{esc(p['caption'])}</figcaption></figure>"
+                for p in photos
+            )
+            if can_show_images
+            else "<p class='muted'>Images hidden by under-18 privacy setting.</p>"
+        )
+        if not gallery_html:
+            gallery_html = "<p class='muted'>No gallery photos.</p>"
+        body = f"""
+        <div class='card school-accent'>
+          <div class='profile-head'>
+            <img class='avatar large' src='{esc(profile_img)}' alt='avatar'>
+            <div>
+              <h2>{esc(target['name'])} {school_symbol}</h2>
+              <p class='muted'>{esc(target['role']).title()} {'• ' + esc(target['school_name']) if target['school_name'] else ''}</p>
+              <p>{esc(target['status_text'] or 'No status provided.')}</p>
+            </div>
+          </div>
+          <p>{esc(target['bio'] or 'No bio provided.')}</p>
+          <div class='tag-wrap'>
+            <span class='tag'>Grade: {esc(target['grade_level'] or 'N/A')}</span>
+            <span class='tag'>Age: {esc(target['age'] or 'N/A')}</span>
+            <span class='tag'>Height: {esc(target['height'] or 'N/A')}</span>
+            <span class='tag'>Weight: {esc(target['weight'] or 'N/A')}</span>
+            <span class='tag'>Hometown: {esc(target['hometown'] or 'N/A')} {esc(target['state'] or '')}</span>
+          </div>
+        </div>
+        <div class='card' style='margin-top:12px'><h3>Gallery</h3><div class='gallery'>{gallery_html}</div></div>
+        """
+        return html_page("Public Profile", body, current_user)
+
+    def my_profile(self, user: sqlite3.Row) -> str:
+        with db_conn() as conn:
+            schools = conn.execute("SELECT name FROM schools ORDER BY name").fetchall()
+            photos = conn.execute("SELECT id, image_url, caption FROM galleries WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+            school_name = ""
+            if user["school_id"]:
+                school = conn.execute("SELECT name FROM schools WHERE id=?", (user["school_id"],)).fetchone()
+                school_name = school["name"] if school else ""
+        school_options = "".join(f"<option value='{esc(s['name'])}'></option>" for s in schools)
+        photo_rows = "".join(
+            f"<div class='gallery-admin-row'><img src='{esc(p['image_url'])}' alt='gallery'><span>{esc(p['caption'])}</span></div>"
+            for p in photos
+        ) or "<p class='muted'>No gallery photos.</p>"
+        body = f"""
+        <div class='grid'>
+          <div class='card school-accent'>
+            <h2>My Profile</h2>
+            <form method='post' action='/profile'>
+              <label>Name<input name='name' value='{esc(user['name'])}' required></label>
+              <label>Status<input name='status_text' value='{esc(user['status_text'] or '')}'></label>
+              <label>Bio<textarea name='bio'>{esc(user['bio'] or '')}</textarea></label>
+              <label>Profile Image URL<input name='profile_image_url' value='{esc(user['profile_image_url'] or '')}'></label>
+              <div class='row'>
+                <label>Grade Level<input name='grade_level' value='{esc(user['grade_level'] or '')}'></label>
+                <label>Age<input type='number' min='1' max='99' name='age' value='{esc(user['age'] or '')}'></label>
+              </div>
+              <div class='row'>
+                <label>Height<input name='height' value='{esc(user['height'] or '')}'></label>
+                <label>Weight<input name='weight' value='{esc(user['weight'] or '')}'></label>
+              </div>
+              <div class='row'>
+                <label>Hometown<input name='hometown' value='{esc(user['hometown'] or '')}'></label>
+                <label>State<input name='state' value='{esc(user['state'] or '')}'></label>
+              </div>
+              <label>School<input list='schools' name='school_name' value='{esc(school_name)}' placeholder='Must be a coach-defined school'></label>
+              <datalist id='schools'>{school_options}</datalist>
+              <label><input type='checkbox' name='profile_private' value='1' {'checked' if user['profile_private'] else ''}> Make profile private</label>
+              <button type='submit'>Save Profile</button>
+            </form>
+          </div>
+          <div class='card'>
+            <h3>Gallery Uploads</h3>
+            <form method='post' action='/profile/gallery'>
+              <label>Image URL<input name='image_url' required></label>
+              <label>Caption<input name='caption'></label>
+              <button type='submit'>Add Photo</button>
+            </form>
+            <div style='margin-top:12px'>{photo_rows}</div>
+          </div>
+        </div>
+        """
+        return html_page("My Profile", body, user)
+
+    def update_profile(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        school_name = form.get("school_name", "").strip()
+        with db_conn() as conn:
+            school_id = None
+            if school_name:
+                school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
+                school_id = school["id"] if school else None
+            conn.execute(
+                """
+                UPDATE users SET
+                    name=?, status_text=?, bio=?, profile_image_url=?, grade_level=?, age=?,
+                    height=?, weight=?, hometown=?, state=?, school_id=?, profile_private=?
+                WHERE id=?
+                """,
+                (
+                    form.get("name", user["name"]).strip() or user["name"],
+                    form.get("status_text", "").strip(),
+                    form.get("bio", "").strip(),
+                    form.get("profile_image_url", "").strip(),
+                    form.get("grade_level", "").strip(),
+                    to_int(form.get("age", "0"), 0) or None,
+                    form.get("height", "").strip(),
+                    form.get("weight", "").strip(),
+                    form.get("hometown", "").strip(),
+                    form.get("state", "").strip(),
+                    school_id,
+                    1 if form.get("profile_private") == "1" else 0,
+                    user["id"],
+                ),
+            )
+        self.redirect("/profile")
+
+    def add_gallery_photo(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        image_url = form.get("image_url", "").strip()
+        parsed = urlparse(image_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return self.redirect("/profile")
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO galleries (user_id, image_url, caption, created_at) VALUES (?,?,?,?)",
+                (user["id"], image_url, form.get("caption", "").strip(), utc_now().isoformat()),
+            )
+        self.redirect("/profile")
+
+    def admin_page(self, user: sqlite3.Row) -> str:
+        with db_conn() as conn:
+            accounts = conn.execute(
+                "SELECT id,username,name,role,locked,is_admin FROM users ORDER BY is_admin DESC, id"
+            ).fetchall()
+            about_text = get_setting(conn, "about_text", "")
+            home_cover = get_setting(conn, "home_cover_url", "")
+            registration_open = setting_bool(conn, "registration_open", True)
+            hide_minor_images_public = setting_bool(conn, "hide_minor_images_public", True)
+        rows: list[str] = []
+        for a in accounts:
+            delete_opt = "" if a["is_admin"] else "<option value='delete'>Delete Account</option>"
+            rows.append(
+                f"<tr><td>{a['id']}</td><td>{esc(a['name'])}</td><td>{esc(a['username'])}</td><td>{esc(a['role'])}</td><td>{'Yes' if a['locked'] else 'No'}</td>"
+                f"<td><form method='post' action='/admin/account-action' class='inline'><input type='hidden' name='user_id' value='{a['id']}'>"
+                f"<select name='action'><option value='lock'>Lock</option><option value='unlock'>Unlock</option><option value='reset'>Reset Password</option>{delete_opt}</select><button type='submit'>Apply</button></form></td></tr>"
+            )
+        account_rows = "".join(rows)
+        body = f"""
+        <div class='grid'>
+          <div class='card'>
+            <h2>Site Settings</h2>
+            <form method='post' action='/admin/settings'>
+              <label>About Text<textarea name='about_text'>{esc(about_text)}</textarea></label>
+              <label>Home Cover Image URL<input name='home_cover_url' value='{esc(home_cover)}'></label>
+              <label><input type='checkbox' name='registration_open' value='1' {'checked' if registration_open else ''}> Enable new account creation</label>
+              <label><input type='checkbox' name='hide_minor_images_public' value='1' {'checked' if hide_minor_images_public else ''}> Hide under-18 athlete images publicly</label>
+              <label>Admin Email / Username<input name='admin_username' value='{esc(user['username'])}' required></label>
+              <label>Admin New Password<input type='password' name='admin_password'></label>
+              <button type='submit'>Save Admin Settings</button>
+            </form>
+          </div>
+          <div class='card'>
+            <h2>All Accounts</h2>
+            <p class='muted'>Password reset sets a temporary password of <strong>Reset123!</strong>; share it securely and require user to update afterward.</p>
+            <table><tr><th>ID</th><th>Name</th><th>Username</th><th>Role</th><th>Locked</th><th>Actions</th></tr>{account_rows}</table>
+          </div>
+        </div>
+        """
+        return html_page("Admin", body, user)
+
+    def update_admin_settings(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        admin_username = form.get("admin_username", "").strip()
+        admin_password = form.get("admin_password", "")
+        with db_conn() as conn:
+            set_setting(conn, "about_text", form.get("about_text", "").strip())
+            set_setting(conn, "home_cover_url", form.get("home_cover_url", "").strip())
+            set_setting(conn, "registration_open", "1" if form.get("registration_open") == "1" else "0")
+            set_setting(conn, "hide_minor_images_public", "1" if form.get("hide_minor_images_public") == "1" else "0")
+            if admin_username:
+                exists = conn.execute("SELECT id FROM users WHERE username=? AND id<>?", (admin_username, user["id"])).fetchone()
+                if not exists:
+                    conn.execute("UPDATE users SET username=? WHERE id=?", (admin_username, user["id"]))
+            if admin_password:
+                conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password(admin_password), user["id"]))
+        self.redirect("/admin")
+
+    def admin_account_action(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        account_id = to_int(form.get("user_id", "0"), 0)
+        action = form.get("action", "")
+        with db_conn() as conn:
+            target = conn.execute("SELECT * FROM users WHERE id=?", (account_id,)).fetchone()
+            if target is None:
+                return self.redirect("/admin")
+            if action == "lock":
+                conn.execute("UPDATE users SET locked=1 WHERE id=?", (account_id,))
+            elif action == "unlock":
+                conn.execute("UPDATE users SET locked=0 WHERE id=?", (account_id,))
+            elif action == "reset":
+                conn.execute("UPDATE users SET password=? WHERE id=?", (hash_password("Reset123!"), account_id))
+            elif action == "delete" and not target["is_admin"]:
+                athlete = conn.execute("SELECT id FROM athletes WHERE user_id=?", (account_id,)).fetchone()
+                if athlete:
+                    conn.execute("DELETE FROM assignments WHERE athlete_id=?", (athlete["id"],))
+                    conn.execute("DELETE FROM throw_logs WHERE athlete_id=?", (athlete["id"],))
+                    conn.execute("DELETE FROM lift_logs WHERE athlete_id=?", (athlete["id"],))
+                    conn.execute("DELETE FROM meet_results WHERE athlete_id=?", (athlete["id"],))
+                    conn.execute("DELETE FROM prs WHERE athlete_id=?", (athlete["id"],))
+                    conn.execute("DELETE FROM athletes WHERE id=?", (athlete["id"],))
+                conn.execute("DELETE FROM galleries WHERE user_id=?", (account_id,))
+                conn.execute("DELETE FROM users WHERE id=?", (account_id,))
+        self.redirect("/admin")
+
+    def coach_schools(self, user: sqlite3.Row) -> str:
+        with db_conn() as conn:
+            schools = conn.execute("SELECT * FROM schools WHERE coach_user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+        rows = "".join(
+            f"<tr><td>{esc(s['name'])}</td><td>{esc(s['color_primary'])}</td><td>{esc(s['color_secondary'])}</td><td>{esc(s['symbol_url'])}</td></tr>"
+            for s in schools
+        ) or "<tr><td colspan='4' class='muted'>No schools yet.</td></tr>"
+        body = f"""
+        <div class='grid'>
+          <div class='card'>
+            <h3>Create School</h3>
+            <form method='post' action='/coach/schools'>
+              <label>School Name<input name='name' required></label>
+              <div class='row'>
+                <label>Primary Color<input type='color' name='color_primary' value='#2563eb'></label>
+                <label>Secondary Color<input type='color' name='color_secondary' value='#0f172a'></label>
+              </div>
+              <label>School Symbol URL<input name='symbol_url'></label>
+              <button type='submit'>Save School</button>
+            </form>
+          </div>
+          <div class='card'><h3>My Schools</h3><table><tr><th>Name</th><th>Primary</th><th>Secondary</th><th>Symbol</th></tr>{rows}</table></div>
+        </div>
+        """
+        return html_page("Schools", body, user)
+
+    def add_school(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        name = form.get("name", "").strip()
+        if not name:
+            return self.redirect("/coach/schools")
+        with db_conn() as conn:
+            existing = conn.execute("SELECT id FROM schools WHERE name=?", (name,)).fetchone()
+            if existing:
+                return self.redirect("/coach/schools")
+            conn.execute(
+                "INSERT INTO schools (coach_user_id, name, color_primary, color_secondary, symbol_url) VALUES (?,?,?,?,?)",
+                (
+                    user["id"],
+                    name,
+                    form.get("color_primary", "#2563eb"),
+                    form.get("color_secondary", "#0f172a"),
+                    form.get("symbol_url", "").strip(),
+                ),
+            )
+        self.redirect("/coach/schools")
+
+    def coach_athlete_privacy(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        athlete_id = to_int(form.get("athlete_id", "0"), 0)
+        force_private = 1 if form.get("force_private") == "1" else 0
+        with db_conn() as conn:
+            athlete = conn.execute("SELECT user_id, coach_user_id FROM athletes WHERE id=?", (athlete_id,)).fetchone()
+            if athlete and athlete["coach_user_id"] == user["id"]:
+                conn.execute("UPDATE users SET force_private=? WHERE id=?", (force_private, athlete["user_id"]))
+        self.redirect("/coach/athletes")
+
+    def coach_athlete_school(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        user_id = to_int(form.get("user_id", "0"), 0)
+        school_id = to_int(form.get("school_id", "0"), 0)
+        with db_conn() as conn:
+            athlete = conn.execute("SELECT coach_user_id FROM athletes WHERE user_id=?", (user_id,)).fetchone()
+            school = conn.execute("SELECT id FROM schools WHERE id=? AND coach_user_id=?", (school_id, user["id"])).fetchone() if school_id else None
+            if athlete and athlete["coach_user_id"] == user["id"]:
+                conn.execute("UPDATE users SET school_id=? WHERE id=?", (school["id"] if school else None, user_id))
+        self.redirect("/coach/athletes")
 
     def coach_dashboard(self, user: sqlite3.Row) -> str:
         today = date.today().isoformat()
@@ -557,16 +1176,24 @@ class AppHandler(BaseHTTPRequestHandler):
             athletes = conn.execute(
                 """
                 SELECT a.id, COALESCE(u.name,'Unlinked') AS name, COALESCE(u.username,'(none)') AS username,
-                       a.sex, a.events, COALESCE(a.group_name,'') AS group_name
+                       a.sex, a.events, COALESCE(a.group_name,'') AS group_name,
+                       u.profile_private, u.force_private, u.id AS user_id, COALESCE(s.name,'') AS school_name
                 FROM athletes a
                 LEFT JOIN users u ON u.id=a.user_id
+                LEFT JOIN schools s ON s.id=u.school_id
                 ORDER BY name
                 """
             ).fetchall()
+            school_choices = conn.execute("SELECT id,name FROM schools WHERE coach_user_id=? ORDER BY name", (user["id"],)).fetchall()
 
+        school_options = "".join(f"<option value='{s['id']}'>{esc(s['name'])}</option>" for s in school_choices)
         rows = "".join(
             f"<tr><td>{r['id']}</td><td>{esc(r['name'])}</td><td>{esc(r['username'])}</td>"
-            f"<td>{esc(r['sex'])}</td><td>{esc(r['events'])}</td><td>{esc(r['group_name'])}</td></tr>"
+            f"<td>{esc(r['school_name'])}</td><td>{'Yes' if r['profile_private'] or r['force_private'] else 'No'}</td>"
+            f"<td><form method='post' action='/coach/athlete/privacy' class='inline'>"
+            f"<input type='hidden' name='athlete_id' value='{r['id']}'><select name='force_private'><option value='0'>Public</option><option value='1' {'selected' if r['force_private'] else ''}>Force Private</option></select><button type='submit'>Save</button></form>"
+            f"<form method='post' action='/coach/athlete/school' class='inline'>"
+            f"<input type='hidden' name='user_id' value='{r['user_id']}'><select name='school_id'><option value=''>No School</option>{school_options}</select><button type='submit'>Set School</button></form></td></tr>"
             for r in athletes
         ) or "<tr><td colspan='6' class='muted'>No athletes yet.</td></tr>"
 
@@ -592,7 +1219,7 @@ class AppHandler(BaseHTTPRequestHandler):
           <div class='card'>
             <h3>Athlete Roster</h3>
             <table>
-              <tr><th>ID</th><th>Name</th><th>Username</th><th>Sex</th><th>Events</th><th>Group</th></tr>
+              <tr><th>ID</th><th>Name</th><th>Username</th><th>School</th><th>Private</th><th>Controls</th></tr>
               {rows}
             </table>
           </div>
@@ -618,8 +1245,8 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             user_id = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"]
             conn.execute(
-                "INSERT INTO athletes (user_id,sex,events,group_name) VALUES (?,?,?,?)",
-                (user_id, form.get("sex", "Male"), form.get("events", "Shot Put"), form.get("group_name", "")),
+                "INSERT INTO athletes (user_id,sex,events,group_name,coach_user_id) VALUES (?,?,?,?,?)",
+                (user_id, form.get("sex", "Male"), form.get("events", "Shot Put"), form.get("group_name", ""), user["id"]),
             )
         self.redirect("/coach/athletes")
 
@@ -1033,38 +1660,54 @@ class AppHandler(BaseHTTPRequestHandler):
         return html_page("Athlete Progress", body, user)
 
 
+def home_page() -> str:
+    with db_conn() as conn:
+        about = esc(get_setting(conn, "about_text", "Bayou Bombers is a modern throws platform."))
+        cover = esc(get_setting(conn, "home_cover_url", ""))
+    tmpl = read_template("home.html")
+    if not tmpl:
+        tmpl = """
+        <section class='hero' style="--cover:url('{{cover_url}}')">
+          <div class='card'>
+            <h2>Bayou Bombers</h2>
+            <p>{{about_text}}</p>
+            <div class='inline'><a class='btn' href='/login'>Login</a><a class='btn secondary' href='/search'>Search Public Profiles</a></div>
+          </div>
+        </section>
+        """
+    body = tmpl.replace("{{about_text}}", about).replace("{{cover_url}}", cover)
+    return html_page("Bayou Bombers", body)
+
+
 def login_page(message: str | None = None) -> str:
     msg_html = f"<div class='card' style='margin-bottom:12px'>{esc(message)}</div>" if message else ""
-    body = f"""
-    {msg_html}
-    <div class='grid'>
-      <div class='card'>
-        <h2>Login</h2>
-        <form method='post' action='/login'>
-          <label>Username<input name='username' required></label>
-          <label>Password<input type='password' name='password' required></label>
-          <button type='submit'>Sign In</button>
-        </form>
-      </div>
-      <div class='card'>
-        <h3>Demo Accounts</h3>
-        <p><strong>Admin:</strong> admin@admin.com / password123</p>
-        <p><strong>Coach:</strong> coach / coach123</p>
-        <p><strong>Athlete:</strong> athlete / athlete123</p>
-        <p class='muted'>The app is preloaded with athlete setup, modules, and production-ready MVP data tables.</p>
-      </div>
-    </div>
-    """
-    return html_page("Bayou Bombers Login", body)
+    tmpl = read_template("login.html")
+    if not tmpl:
+        tmpl = """
+        <div class='grid'>
+          <div class='card'>
+            <h2>Login</h2>
+            <form method='post' action='/login'>
+              <label>Username<input name='username' required></label>
+              <label>Password<input type='password' name='password' required></label>
+              <button type='submit'>Sign In</button>
+            </form>
+          </div>
+          <div class='card'>
+            <h3>About</h3>
+            <p>Please sign in to continue.</p>
+            <p class='muted'>Use search to browse public coach and athlete profiles.</p>
+            <a class='btn secondary' href='/search'>Search Public Profiles</a>
+          </div>
+        </div>
+        """
+    return html_page("Bayou Bombers Login", msg_html + tmpl)
 
 
 def run_server(host: str, port: int) -> None:
     init_db()
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"Bayou Bombers app running at http://{host}:{port}")
-    print("Default admin login: admin@admin.com / password123")
-    print("Demo coach login: coach / coach123")
-    print("Demo athlete login: athlete / athlete123")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

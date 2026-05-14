@@ -11,11 +11,11 @@ python3 app.py
 
 Then open `http://127.0.0.1:8000`.
 
-## Demo Accounts
+## Home Experience
 
-- Admin: `admin@admin.com` / `password123`
-- Coach: `coach` / `coach123`
-- Athlete: `athlete` / `athlete123`
+- Home page now shows About content and entry links (Login, Search, Register).
+- Public search supports coach/athlete profile discovery with privacy filtering.
+- Admin can update About text, home cover image, and account creation policy.
 
 ## Included MVP Areas
 
