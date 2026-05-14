@@ -941,7 +941,8 @@ class AppHandler(BaseHTTPRequestHandler):
         form = self.read_form()
         weight = max(to_float(form.get("weight", "0"), 0.0), 0.0)
         reps = max(to_int(form.get("reps", "1"), 1), 1)
-        # Epley-estimated one-rep max: weight * (1 + reps/30).
+        # Epley-estimated one-rep max (approximation): weight * (1 + reps/30);
+        # less accurate at higher rep ranges and for some lift patterns.
         projected_max = round(weight * (1 + reps / 30), 1)
         lift_name = form.get("lift_name", "Lift").strip() or "Lift"
         with db_conn() as conn:
