@@ -281,6 +281,8 @@ def init_db() -> None:
                 ("admin@admin.com", hash_password("password123"), "coach", "Admin Coach"),
             )
             admin = conn.execute("SELECT id FROM users WHERE username='admin@admin.com'").fetchone()
+        if admin is None:
+            raise RuntimeError("Failed to initialize admin account")
         conn.execute("UPDATE users SET is_admin=1 WHERE id=?", (admin["id"],))
 
         athlete_user = conn.execute("SELECT id FROM users WHERE username='athlete' ").fetchone()
@@ -342,6 +344,7 @@ def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
         raise ValueError("Unsupported table name")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
         raise ValueError("Invalid column name")
+    # Safe interpolation: table is strictly allowlisted above and cannot be user-controlled.
     cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return any(c["name"] == column for c in cols)
 
@@ -355,6 +358,7 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: s
         raise ValueError("Unsupported SQL type")
     if not column_exists(conn, table, column):
         default_part = f" DEFAULT {default_sql}" if default_sql else ""
+        # Safe interpolation: table/column/sql_type are validated to strict allowlists/patterns.
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}{default_part}")
 
 
