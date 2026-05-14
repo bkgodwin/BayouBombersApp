@@ -24,4 +24,38 @@ document.addEventListener('DOMContentLoaded', () => {
       toggle.setAttribute('aria-expanded', String(isOpen));
     });
   }
+
+  // Coach plan assignment select-all controls
+  document.querySelectorAll('form[action="/coach/assign"]').forEach((form) => {
+    const selectAll = form.querySelector('.plan-select-all');
+    const athleteCheckboxes = Array.from(form.querySelectorAll('.plan-athlete-choice'));
+    const athleteIdsInput = form.querySelector('input[name="athlete_ids"]');
+    if (!selectAll || !athleteCheckboxes.length || !athleteIdsInput) return;
+
+    selectAll.addEventListener('change', () => {
+      athleteCheckboxes.forEach((check) => { check.checked = selectAll.checked; });
+    });
+
+    athleteCheckboxes.forEach((check) => {
+      check.addEventListener('change', () => {
+        selectAll.checked = athleteCheckboxes.every((item) => item.checked);
+      });
+    });
+
+    form.addEventListener('submit', (event) => {
+      const selectedIds = athleteCheckboxes.filter((item) => item.checked).map((item) => item.value);
+      athleteIdsInput.value = selectedIds.join(',');
+      if (!selectedIds.length) {
+        event.preventDefault();
+        const submitBtn = form.querySelector('button[type="submit"]');
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          if (submitBtn.dataset.original) {
+            submitBtn.textContent = submitBtn.dataset.original;
+          }
+        }
+        window.alert('Select at least one athlete before assigning this plan.');
+      }
+    });
+  });
 });

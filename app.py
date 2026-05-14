@@ -663,7 +663,7 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None, profile_co
                 ]
             )
     else:
-        nav_links.extend(["<a href='/search'>Search</a>", "<a href='/login'>Login</a>", "<a href='/register'>Join</a>"])
+        nav_links.extend(["<a href='/search'>Search</a>", "<a href='/login'>Login / Register</a>"])
     nav = "".join(nav_links)
     return f"""<!doctype html>
 <html>
@@ -789,6 +789,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/coach/schools" and method == "POST":
             return self.add_school(user)
 
+        if path == "/coach/schools/update" and method == "POST":
+            return self.update_school(user)
+
         if path == "/coach/athlete/privacy" and method == "POST":
             return self.coach_athlete_privacy(user)
 
@@ -811,7 +814,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.add_module(user)
 
         if path == "/coach/plans" and method == "GET":
-            return self.respond_html(self.coach_plans(user))
+            return self.respond_html(self.coach_plans(user, query.get("msg", [""])[0]))
 
         if path == "/coach/plans" and method == "POST":
             return self.add_plan(user)
@@ -952,8 +955,6 @@ class AppHandler(BaseHTTPRequestHandler):
         with db_conn() as conn:
             if not setting_bool(conn, "registration_open", True):
                 return html_page("Registration Closed", "<div class='card'>New account creation is currently disabled.</div>")
-            schools = conn.execute("SELECT name FROM schools ORDER BY name").fetchall()
-        school_options = "".join(f"<option value='{esc(s['name'])}'></option>" for s in schools)
         error_html = f"<div class='notice card'>{esc(error_message)}</div>" if error_message else ""
         body = f"""
         {error_html}
@@ -970,10 +971,10 @@ class AppHandler(BaseHTTPRequestHandler):
               <label>Role<select name='role'><option value='athlete'>Athlete</option><option value='coach'>Coach</option></select></label>
               <label>Age<input type='number' min='1' max='99' name='age'></label>
             </div>
-            <label>School<input list='schools' name='school_name' placeholder='Coach-defined school'></label>
-            <datalist id='schools'>{school_options}</datalist>
+            <p class='muted'>Athletes are assigned to schools by coaches after account creation.</p>
             <button type='submit'>Create Account</button>
           </form>
+          <p class='muted' style='margin-top:10px'>Already have an account? <a href='/login'>Sign in</a>.</p>
         </div>
         """
         return html_page("Register", body)
@@ -994,11 +995,6 @@ class AppHandler(BaseHTTPRequestHandler):
             if exists:
                 return self.respond_html(self.register_page("An account with that email already exists."), status=400)
             username = unique_handle(conn, username)
-            school_id = None
-            school_name = form.get("school_name", "").strip()
-            if school_name:
-                school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
-                school_id = school["id"] if school else None
             try:
                 conn.execute(
                     "INSERT INTO users (username,email,password,role,name,age,school_id) VALUES (?,?,?,?,?,?,?)",
@@ -1009,7 +1005,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         role,
                         form.get("name", "User").strip() or "User",
                         to_int(form.get("age", "0"), 0) or None,
-                        school_id,
+                        None,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -1165,7 +1161,7 @@ class AppHandler(BaseHTTPRequestHandler):
             meet_feed_html = f"<div class='card' style='margin-top:12px'><h3>Meet Results</h3><table><tr><th>Date</th><th>Meet</th><th>Event</th><th>Distance</th><th>Meters</th></tr>{meet_rows}</table></div>"
 
         body = f"""
-        <div class='card school-accent'>
+        <div class='card school-accent profile-hero'>
           <div class='profile-head'>
             <img class='avatar large' src='{esc(profile_img)}' alt='avatar'>
             <div>
@@ -1177,17 +1173,17 @@ class AppHandler(BaseHTTPRequestHandler):
           </div>
           {format_text_block(target['bio'] or '', 'No bio provided.')}
           <div class='tag-wrap'>
-            <span class='tag'>Grade: {esc(target['grade_level'] or 'N/A')}</span>
-            <span class='tag'>Age: {esc(target['age'] or 'N/A')}</span>
-            <span class='tag'>Height: {esc(target['height'] or 'N/A')}</span>
-            <span class='tag'>Weight: {esc(target['weight'] or 'N/A')}</span>
-            <span class='tag'>Hometown: {esc(target['hometown'] or 'N/A')} {esc(target['state'] or '')}</span>
+            <span class='tag profile-stat-chip'>Grade: {esc(target['grade_level'] or 'N/A')}</span>
+            <span class='tag profile-stat-chip'>Age: {esc(target['age'] or 'N/A')}</span>
+            <span class='tag profile-stat-chip'>Height: {esc(target['height'] or 'N/A')}</span>
+            <span class='tag profile-stat-chip'>Weight: {esc(target['weight'] or 'N/A')}</span>
+            <span class='tag profile-stat-chip'>Hometown: {esc(target['hometown'] or 'N/A')} {esc(target['state'] or '')}</span>
           </div>
           {owner_tools}
         </div>
         {meet_feed_html}
-        <div class='card' style='margin-top:12px'><h3>Status Feed</h3>{render_status_feed(statuses)}</div>
-        <div class='card' style='margin-top:12px'><h3>Gallery</h3><div class='gallery'>{gallery_html}</div></div>
+        <div class='card profile-section' style='margin-top:12px'><h3>Status Feed</h3>{render_status_feed(statuses)}</div>
+        <div class='card profile-section' style='margin-top:12px'><h3>Gallery</h3><div class='gallery'>{gallery_html}</div></div>
         """
         return html_page("Public Profile", body, current_user, profile_colors=profile_colors)
 
@@ -1209,6 +1205,14 @@ class AppHandler(BaseHTTPRequestHandler):
             for p in photos
         ) or "<p class='muted'>No gallery photos.</p>"
         error_html = f"<div class='notice card'>{esc(error_message)}</div>" if error_message else ""
+        school_field = (
+            "<label>School<input list='schools' name='school_name' value='"
+            + esc(school_name)
+            + "' placeholder='Must be a coach-defined school'></label>"
+            + f"<datalist id='schools'>{school_options}</datalist>"
+            if user["role"] == "coach" or user["is_admin"]
+            else f"<div class='muted'>School: <strong>{esc(school_name or 'Not assigned yet')}</strong> (set by your coach)</div>"
+        )
         body = f"""
         {error_html}
         <div class='grid'>
@@ -1241,9 +1245,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 <label>Hometown<input name='hometown' value='{esc(user['hometown'] or '')}'></label>
                 <label>State<input name='state' value='{esc(user['state'] or '')}'></label>
               </div>
-              <label>School<input list='schools' name='school_name' value='{esc(school_name)}' placeholder='Must be a coach-defined school'></label>
-              <datalist id='schools'>{school_options}</datalist>
-              <label><input type='checkbox' name='profile_private' value='1' {'checked' if user['profile_private'] else ''}> Make profile private</label>
+              {school_field}
+              <label class='checkbox-row'><input type='checkbox' name='profile_private' value='1' {'checked' if user['profile_private'] else ''}><span>Hide my profile from public search and profile views</span></label>
+              <p class='muted checkbox-help'>When enabled, only you, your coach, and admins can reliably access this profile.</p>
               <button type='submit'>Save Profile</button>
             </form>
           </div>
@@ -1294,10 +1298,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.respond_html(self.my_profile(user, "That email address is already in use."), status=400)
             if username and unique_handle(conn, username, user["id"]) != username:
                 return self.respond_html(self.my_profile(user, "That handle is already in use."), status=400)
-            school_id = None
-            if school_name:
-                school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
-                school_id = school["id"] if school else None
+            school_id = user["school_id"]
+            if user["role"] == "coach" or user["is_admin"]:
+                school_id = None
+                if school_name:
+                    school = conn.execute("SELECT id FROM schools WHERE name=?", (school_name,)).fetchone()
+                    school_id = school["id"] if school else None
             try:
                 conn.execute(
                     """
@@ -1490,6 +1496,27 @@ class AppHandler(BaseHTTPRequestHandler):
           </div>
           <div class='card'><h3>My Schools</h3><table><tr><th>Name</th><th>Primary</th><th>Secondary</th><th>Symbol</th></tr>{rows}</table></div>
         </div>
+        <div class='card' style='margin-top:12px'>
+          <h3>Edit Existing Schools</h3>
+          <div class='stack'>
+            {
+                "".join(
+                    (
+                        f"<form method='post' action='/coach/schools/update' enctype='multipart/form-data' class='school-edit-form'>"
+                        f"<input type='hidden' name='school_id' value='{s['id']}'>"
+                        f"<div class='row'><label>School Name<input name='name' value='{esc(s['name'])}' required></label>"
+                        f"<label>Replace Symbol / Logo<input type='file' name='symbol' accept='image/*'></label></div>"
+                        f"<div class='row'><label>Primary Color<input type='color' name='color_primary' value='{esc(s['color_primary'])}'></label>"
+                        f"<label>Secondary Color<input type='color' name='color_secondary' value='{esc(s['color_secondary'])}'></label></div>"
+                        f"<button type='submit'>Update School</button>"
+                        f"</form>"
+                    )
+                    for s in schools
+                )
+                or "<p class='muted'>Create a school first to enable editing.</p>"
+            }
+          </div>
+        </div>
         """
         return html_page("Schools", body, user)
 
@@ -1516,6 +1543,38 @@ class AppHandler(BaseHTTPRequestHandler):
                     symbol_url,
                 ),
             )
+        self.redirect("/coach/schools")
+
+    def update_school(self, user: sqlite3.Row) -> None:
+        form, files = self.read_form_with_files()
+        school_id = to_int(form.get("school_id", "0"), 0)
+        name = form.get("name", "").strip()
+        if not school_id or not name:
+            return self.redirect("/coach/schools")
+        with db_conn() as conn:
+            existing = conn.execute("SELECT * FROM schools WHERE id=? AND coach_user_id=?", (school_id, user["id"])).fetchone()
+            if existing is None:
+                return self.redirect("/coach/schools")
+            symbol_url = existing["symbol_url"] or ""
+            if "symbol" in files:
+                fname, fdata = files["symbol"]
+                uploaded = save_upload(fname, fdata)
+                if uploaded:
+                    symbol_url = uploaded
+            try:
+                conn.execute(
+                    "UPDATE schools SET name=?, color_primary=?, color_secondary=?, symbol_url=? WHERE id=? AND coach_user_id=?",
+                    (
+                        name,
+                        form.get("color_primary", existing["color_primary"] or "#2563eb"),
+                        form.get("color_secondary", existing["color_secondary"] or "#0f172a"),
+                        symbol_url,
+                        school_id,
+                        user["id"],
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                pass
         self.redirect("/coach/schools")
 
     def coach_athlete_privacy(self, user: sqlite3.Row) -> None:
@@ -1671,13 +1730,13 @@ class AppHandler(BaseHTTPRequestHandler):
         <div class='grid'>
           <div class='card'>
             <h3>Create New Athlete Account</h3>
-            <form method='post' action='/coach/athletes'>
+            <form method='post' action='/coach/athletes' autocomplete='off'>
               <label>Name<input name='name' required></label>
               <div class='row'>
-                <label>Email<input type='email' name='email' required></label>
+                <label>Email<input type='email' name='email' autocomplete='off' autocapitalize='off' spellcheck='false' required></label>
                 <label>Handle<input name='username' placeholder='Optional'></label>
               </div>
-              <label>Password<input type='password' name='password' required></label>
+              <label>Password<input type='password' name='password' autocomplete='new-password' required></label>
               <div class='row'>
                 <label>Sex<select name='sex'><option>Male</option><option>Female</option></select></label>
                 <label>Group<input name='group_name' placeholder='Varsity Throws'></label>
@@ -1869,12 +1928,16 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         self.redirect("/coach/modules")
 
-    def coach_plans(self, user: sqlite3.Row) -> str:
+    def coach_plans(self, user: sqlite3.Row, message: str = "") -> str:
         with db_conn() as conn:
             modules = conn.execute("SELECT id,name,category FROM training_modules ORDER BY name").fetchall()
-            plans = conn.execute("SELECT * FROM practice_plans ORDER BY practice_date DESC, id DESC").fetchall()
+            plans = conn.execute(
+                "SELECT id,title,practice_date,notes,created_by FROM practice_plans WHERE created_by=? ORDER BY practice_date DESC, id DESC",
+                (user["id"],),
+            ).fetchall()
             athletes = conn.execute(
-                "SELECT a.id, COALESCE(u.name, 'Athlete #' || a.id) AS athlete_name FROM athletes a LEFT JOIN users u ON u.id=a.user_id ORDER BY athlete_name"
+                "SELECT a.id, COALESCE(u.name, 'Athlete #' || a.id) AS athlete_name FROM athletes a LEFT JOIN users u ON u.id=a.user_id WHERE a.coach_user_id=? ORDER BY athlete_name",
+                (user["id"],),
             ).fetchall()
 
             plan_cards = []
@@ -1892,23 +1955,48 @@ class AppHandler(BaseHTTPRequestHandler):
                     for it in items
                 ) or "<li class='muted'>No items.</li>"
                 assigned_count = conn.execute("SELECT COUNT(*) AS c FROM assignments WHERE plan_id=?", (p["id"],)).fetchone()["c"]
+                assigned_athletes = conn.execute(
+                    """
+                    SELECT COALESCE(u.name, 'Athlete #' || a.id) AS athlete_name
+                    FROM assignments ass
+                    JOIN athletes a ON a.id=ass.athlete_id
+                    LEFT JOIN users u ON u.id=a.user_id
+                    WHERE ass.plan_id=?
+                    ORDER BY athlete_name
+                    """,
+                    (p["id"],),
+                ).fetchall()
+                assigned_tags = "".join(f"<span class='tag'>{esc(a['athlete_name'])}</span>" for a in assigned_athletes) or "<span class='muted'>No athletes assigned yet.</span>"
+                athlete_checks = "".join(
+                    f"<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-athlete-choice' value='{a['id']}'><span>{esc(a['athlete_name'])}</span></label>"
+                    for a in athletes
+                ) or "<p class='muted'>Add athletes to your roster before assigning plans.</p>"
                 plan_cards.append(
-                    f"<div class='card'><h4>{esc(p['title'])}</h4><div class='muted'>{esc(p['practice_date'])} | {assigned_count} assigned</div><ul>{item_list}</ul>"
-                    f"<form method='post' action='/coach/assign'><input type='hidden' name='plan_id' value='{p['id']}'>"
-                    "<label>Assign to Athletes (comma-separated athlete IDs)"
-                    "<input name='athlete_ids' placeholder='1,2,3'></label><button type='submit'>Assign Plan</button></form></div>"
+                    f"<div class='card plan-card'><h4>{esc(p['title'])}</h4><div class='muted'>{esc(p['practice_date'])} • {assigned_count} assigned</div>"
+                    f"<p>{esc(p['notes'] or 'No plan-level notes.')}</p>"
+                    f"<h5>Modules</h5><ul>{item_list}</ul>"
+                    f"<h5>Assigned Athletes</h5><div class='tag-wrap'>{assigned_tags}</div>"
+                    f"<form method='post' action='/coach/assign'><input type='hidden' name='plan_id' value='{p['id']}'><input type='hidden' name='athlete_ids' value=''>"
+                    "<div class='plan-select-tools'>"
+                    "<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-select-all'><span>Select all athletes</span></label>"
+                    "</div>"
+                    f"<div class='plan-athlete-list'>{athlete_checks}</div>"
+                    "<button type='submit'>Assign to Selected Athletes</button></form></div>"
                 )
 
         module_options = "".join(
             f"<option value='{m['id']}'>{esc(m['name'])} ({esc(m['category'])})</option>" for m in modules
         )
-        athlete_help = ", ".join(f"{a['id']}={esc(a['athlete_name'])}" for a in athletes) or "No athletes found"
+        athlete_help = ", ".join(esc(a["athlete_name"]) for a in athletes) or "No athletes found"
         plans_html = "".join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"
+        message_html = f"<div class='notice card'>{esc(message)}</div>" if message else ""
 
         body = f"""
-        <div class='grid'>
-          <div class='card'>
+        {message_html}
+        <div class='grid plan-layout'>
+          <div class='card school-accent'>
             <h3>Create Practice Plan</h3>
+            <p class='muted'>Build a plan first, then assign it to one or more athletes from a selectable list.</p>
             <form method='post' action='/coach/plans'>
               <label>Title<input name='title' required></label>
               <div class='row'>
@@ -1922,9 +2010,13 @@ class AppHandler(BaseHTTPRequestHandler):
               <label>Plan Notes<textarea name='plan_notes'></textarea></label>
               <button type='submit'>Save Practice Plan</button>
             </form>
-            <p class='muted'>Athlete IDs: {athlete_help}</p>
+            <p class='muted'>Current roster: {athlete_help}</p>
           </div>
-          <div>
+          <div class='stack'>
+            <div class='card'>
+              <h3>Practice Plans</h3>
+              <p class='muted'>Review plan details and assign quickly to one, many, or all athletes.</p>
+            </div>
             {plans_html}
           </div>
         </div>
@@ -1951,12 +2043,18 @@ class AppHandler(BaseHTTPRequestHandler):
         plan_id = to_int(form.get("plan_id", "0"), 0)
         athlete_ids_raw = form.get("athlete_ids", "")
         athlete_ids = [to_int(x, -1) for x in athlete_ids_raw.split(",") if x.strip()]
-        if not athlete_ids:
-            self.redirect("/coach/plans")
+        if not athlete_ids or plan_id < 1:
+            self.redirect("/coach/plans?msg=Please+select+at+least+one+athlete+to+assign.")
             return
         with db_conn() as conn:
+            plan = conn.execute("SELECT id FROM practice_plans WHERE id=? AND created_by=?", (plan_id, user["id"])).fetchone()
+            if plan is None:
+                return self.redirect("/coach/plans?msg=That+practice+plan+could+not+be+assigned.")
             for athlete_id in athlete_ids:
                 if athlete_id < 1:
+                    continue
+                athlete = conn.execute("SELECT id FROM athletes WHERE id=? AND coach_user_id=?", (athlete_id, user["id"])).fetchone()
+                if athlete is None:
                     continue
                 existing = conn.execute(
                     "SELECT id FROM assignments WHERE plan_id=? AND athlete_id=?",
@@ -1967,7 +2065,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "INSERT INTO assignments (plan_id,athlete_id,status,assigned_on) VALUES (?,?,?,?)",
                         (plan_id, athlete_id, "assigned", date.today().isoformat()),
                     )
-        self.redirect("/coach/plans")
+        self.redirect("/coach/plans?msg=Plan+assigned+to+selected+athletes.")
 
     def coach_reports(self, user: sqlite3.Row) -> str:
         since = (date.today() - timedelta(days=7)).isoformat()
@@ -2283,7 +2381,7 @@ def home_page(user: sqlite3.Row | None = None) -> str:
         secondary_cta_url = f"/profile/{user['id']}"
         welcome = f"<span class='eyebrow'>Welcome back, {esc(user['name'])}</span>"
     else:
-        primary_cta_text = "Log In"
+        primary_cta_text = "Login / Register"
         primary_cta_url = "/login"
         secondary_cta_text = "Search Public Profiles"
         secondary_cta_url = "/search"
@@ -2330,7 +2428,7 @@ def login_page(message: str | None = None) -> str:
             <h3>About</h3>
             <p>Sign in with your email to manage training, profiles, and updates.</p>
             <p class='muted'>Use search to browse public coach and athlete profiles or head back home for the latest cover image and announcements.</p>
-            <div class='inline'><a class='btn secondary' href='/search'>Search Public Profiles</a><a class='btn secondary' href='/'>Home</a></div>
+            <div class='inline'><a class='btn secondary' href='/search'>Search Public Profiles</a><a class='btn secondary' href='/'>Home</a><a class='btn secondary' href='/register'>Need an account? Register</a></div>
           </div>
         </div>
         """
