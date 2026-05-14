@@ -352,8 +352,10 @@ button.secondary {
 }
 
 .profile-hero {
+  background: linear-gradient(145deg, rgba(37, 99, 235, 0.12), rgba(255, 255, 255, 0.98));
   background:
     linear-gradient(145deg, color-mix(in srgb, var(--school-primary) 14%, white), rgba(255, 255, 255, 0.98));
+  border: 1px solid rgba(37, 99, 235, 0.3);
   border: 1px solid color-mix(in srgb, var(--school-primary) 30%, #cbd5e1);
 }
 
@@ -362,14 +364,17 @@ button.secondary {
 }
 
 .profile-stat-chip {
+  background: rgba(37, 99, 235, 0.12);
   background: color-mix(in srgb, var(--school-primary) 16%, white);
   color: var(--school-secondary);
+  border: 1px solid rgba(37, 99, 235, 0.24);
   border: 1px solid color-mix(in srgb, var(--school-primary) 30%, #cbd5e1);
 }
 
 .profile-section h3 {
   margin-top: 0;
   padding-bottom: 8px;
+  border-bottom: 2px solid rgba(37, 99, 235, 0.2);
   border-bottom: 2px solid color-mix(in srgb, var(--school-primary) 24%, #e2e8f0);
 }
 
@@ -381,6 +386,7 @@ button.secondary {
   background: #fff;
   border-radius: 6px;
   padding: 2px;
+  border: 1px solid rgba(37, 99, 235, 0.24);
   border: 1px solid color-mix(in srgb, var(--school-primary) 30%, #cbd5e1);
 }
 
@@ -452,6 +458,7 @@ button.secondary {
 
 .status-card {
   margin-bottom: 12px;
+  border-left: 4px solid rgba(37, 99, 235, 0.45);
   border-left: 4px solid color-mix(in srgb, var(--school-primary) 45%, #94a3b8);
 }
 
