@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import html
+import hmac
+import hashlib
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -21,6 +24,25 @@ def db_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return f"pbkdf2_sha256${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+
+
+def verify_password(candidate: str, stored: str) -> bool:
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, salt_b64, digest_b64 = stored.split("$", 2)
+            salt = base64.b64decode(salt_b64)
+            expected = base64.b64decode(digest_b64)
+        except (ValueError, TypeError):
+            return False
+        actual = hashlib.pbkdf2_hmac("sha256", candidate.encode("utf-8"), salt, 200_000)
+        return hmac.compare_digest(actual, expected)
+    return hmac.compare_digest(candidate, stored)
 
 
 def feet_inches_to_metrics(feet: int, inches: int) -> tuple[int, float]:
@@ -190,20 +212,20 @@ def init_db() -> None:
         if coach is None:
             conn.execute(
                 "INSERT INTO users (username, password, role, name) VALUES (?,?,?,?)",
-                ("coach", "coach123", "coach", "Head Coach"),
+                ("coach", hash_password("coach123"), "coach", "Head Coach"),
             )
         admin = conn.execute("SELECT id FROM users WHERE username='admin@admin.com'").fetchone()
         if admin is None:
             conn.execute(
                 "INSERT INTO users (username, password, role, name) VALUES (?,?,?,?)",
-                ("admin@admin.com", "password123", "coach", "Admin Coach"),
+                ("admin@admin.com", hash_password("password123"), "coach", "Admin Coach"),
             )
 
         athlete_user = conn.execute("SELECT id FROM users WHERE username='athlete' ").fetchone()
         if athlete_user is None:
             conn.execute(
                 "INSERT INTO users (username, password, role, name) VALUES (?,?,?,?)",
-                ("athlete", "athlete123", "athlete", "Sample Athlete"),
+                ("athlete", hash_password("athlete123"), "athlete", "Sample Athlete"),
             )
             athlete_user = conn.execute("SELECT id FROM users WHERE username='athlete'").fetchone()
 
@@ -408,11 +430,8 @@ class AppHandler(BaseHTTPRequestHandler):
         username = form.get("username", "").strip()
         password = form.get("password", "")
         with db_conn() as conn:
-            user = conn.execute(
-                "SELECT * FROM users WHERE username=? AND password=?",
-                (username, password),
-            ).fetchone()
-        if user is None:
+            user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if user is None or not verify_password(password, user["password"]):
             return self.respond_html(login_page("Invalid username or password."), status=401)
         token = secrets.token_urlsafe(24)
         SESSIONS[token] = {"user_id": str(user["id"]), "created": datetime.utcnow().isoformat()}
@@ -557,7 +576,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.respond_html(self.coach_athletes(user).replace("<main>", "<main><div class='card'>Username already exists.</div>", 1), status=400)
             conn.execute(
                 "INSERT INTO users (username,password,role,name) VALUES (?,?,?,?)",
-                (username, form.get("password", "athlete123"), "athlete", form.get("name", "Athlete")),
+                (
+                    username,
+                    hash_password(form.get("password", "athlete123")),
+                    "athlete",
+                    form.get("name", "Athlete"),
+                ),
             )
             user_id = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"]
             conn.execute(

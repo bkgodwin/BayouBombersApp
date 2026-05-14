@@ -5,7 +5,7 @@ Responsive MVP web application for Bayou Bombers throws training operations, imp
 ## Run
 
 ```bash
-cd /home/runner/work/BayouBombersApp/BayouBombersApp
+cd <project-directory>
 python3 app.py
 ```
 
