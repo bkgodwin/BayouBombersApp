@@ -734,13 +734,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 f"<div class='profile-head'><img class='avatar' src='{esc(avatar)}' alt='avatar'>"
                 f"<div><h3>{esc(row['name'])}</h3><p class='muted'>{esc(row['role'])} {esc(row['school_name'])}</p></div></div></a>"
             )
+        cards_html = "".join(cards) or "<div class='card'>No profiles found.</div>"
         body = (
             "<div class='card'><h2>Search Coaches & Athletes</h2>"
             "<form method='get' action='/search'><div class='inline'>"
             f"<input name='q' value='{esc(q)}' placeholder='Search by name or username'>"
             "<button type='submit'>Search</button></div></form>"
             "<p class='muted'>Private profiles are hidden from search and viewing.</p></div>"
-            f"<div class='grid' style='margin-top:12px'>{''.join(cards) or \"<div class='card'>No profiles found.</div>\"}</div>"
+            f"<div class='grid' style='margin-top:12px'>{cards_html}</div>"
         )
         return html_page("Search", body, current_user)
 
@@ -902,12 +903,15 @@ class AppHandler(BaseHTTPRequestHandler):
             home_cover = get_setting(conn, "home_cover_url", "")
             registration_open = setting_bool(conn, "registration_open", True)
             hide_minor_images_public = setting_bool(conn, "hide_minor_images_public", True)
-        account_rows = "".join(
-            f"<tr><td>{a['id']}</td><td>{esc(a['name'])}</td><td>{esc(a['username'])}</td><td>{esc(a['role'])}</td><td>{'Yes' if a['locked'] else 'No'}</td>"
-            f"<td><form method='post' action='/admin/account-action' class='inline'><input type='hidden' name='user_id' value='{a['id']}'>"
-            f"<select name='action'><option value='lock'>Lock</option><option value='unlock'>Unlock</option><option value='reset'>Reset Password</option>{'' if a['is_admin'] else '<option value=\\'delete\\'>Delete Account</option>'}</select><button type='submit'>Apply</button></form></td></tr>"
-            for a in accounts
-        )
+        rows: list[str] = []
+        for a in accounts:
+            delete_opt = "" if a["is_admin"] else "<option value='delete'>Delete Account</option>"
+            rows.append(
+                f"<tr><td>{a['id']}</td><td>{esc(a['name'])}</td><td>{esc(a['username'])}</td><td>{esc(a['role'])}</td><td>{'Yes' if a['locked'] else 'No'}</td>"
+                f"<td><form method='post' action='/admin/account-action' class='inline'><input type='hidden' name='user_id' value='{a['id']}'>"
+                f"<select name='action'><option value='lock'>Lock</option><option value='unlock'>Unlock</option><option value='reset'>Reset Password</option>{delete_opt}</select><button type='submit'>Apply</button></form></td></tr>"
+            )
+        account_rows = "".join(rows)
         body = f"""
         <div class='grid'>
           <div class='card'>
