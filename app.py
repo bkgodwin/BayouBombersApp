@@ -25,6 +25,8 @@ SESSION_TTL_SECONDS = 60 * 60 * 12
 FORCE_SECURE_COOKIE = os.getenv("BAYOU_COOKIE_SECURE", "false").lower() == "true"
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
+HANDLE_SUFFIX_MIN = 100
+HANDLE_SUFFIX_SPAN = 900
 
 
 def db_conn() -> sqlite3.Connection:
@@ -42,8 +44,8 @@ def normalize_email(value: str) -> str:
 
 
 def slugify_text(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    return slug or "member"
+    normalized_slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return normalized_slug or "member"
 
 
 def hash_password(password: str) -> str:
@@ -284,7 +286,12 @@ def init_db() -> None:
             existing_email = normalize_email(row["email"] or "")
             if existing_email:
                 continue
-            seed = row["username"] if "@" in (row["username"] or "") else f"{row['username'] or row['name'] or 'member'}@bayoubombers.app"
+            username_value = row["username"] or ""
+            if "@" in username_value:
+                seed = username_value
+            else:
+                seed_source = username_value or row["name"] or "member"
+                seed = f"{seed_source}@bayoubombers.app"
             conn.execute("UPDATE users SET email=? WHERE id=?", (next_available_email(conn, seed, row["id"]), row["id"]))
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email)")
 
@@ -442,7 +449,30 @@ def next_available_email(conn: sqlite3.Connection, seed: str, exclude_user_id: i
 
 
 def is_valid_email(value: str) -> bool:
-    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalize_email(value)))
+    email = normalize_email(value)
+    if not email or " " in email or email.count("@") != 1:
+        return False
+    local_part, domain_part = email.split("@", 1)
+    if not local_part or not domain_part or "." not in domain_part:
+        return False
+    if domain_part.startswith(".") or domain_part.endswith(".") or ".." in domain_part:
+        return False
+    return True
+
+
+def unique_handle(conn: sqlite3.Connection, handle: str, exclude_user_id: int | None = None) -> str:
+    cleaned = handle.strip()
+    if not cleaned:
+        return ""
+    candidate = cleaned
+    while True:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username=?" + (" AND id<>?" if exclude_user_id is not None else ""),
+            (candidate, exclude_user_id) if exclude_user_id is not None else (candidate,),
+        ).fetchone()
+        if existing is None:
+            return candidate
+        candidate = f"{cleaned}-{secrets.randbelow(HANDLE_SUFFIX_SPAN) + HANDLE_SUFFIX_MIN}"
 
 
 def optional_http_url(value: str) -> str:
@@ -858,9 +888,7 @@ class AppHandler(BaseHTTPRequestHandler):
             exists = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
             if exists:
                 return self.respond_html(self.register_page("An account with that email already exists."), status=400)
-            handle_exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
-            if handle_exists:
-                username = f"{username}-{secrets.randbelow(900) + 100}"
+            username = unique_handle(conn, username)
             school_id = None
             school_name = form.get("school_name", "").strip()
             if school_name:
@@ -1115,10 +1143,7 @@ class AppHandler(BaseHTTPRequestHandler):
             email_exists = conn.execute("SELECT id FROM users WHERE email=? AND id<>?", (email, user["id"])).fetchone()
             if email_exists:
                 return self.respond_html(self.my_profile(user, "That email address is already in use."), status=400)
-            username_exists = None
-            if username:
-                username_exists = conn.execute("SELECT id FROM users WHERE username=? AND id<>?", (username, user["id"])).fetchone()
-            if username_exists:
+            if username and unique_handle(conn, username, user["id"]) != username:
                 return self.respond_html(self.my_profile(user, "That handle is already in use."), status=400)
             school_id = None
             if school_name:
@@ -1483,9 +1508,7 @@ class AppHandler(BaseHTTPRequestHandler):
             exists = conn.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
             if exists:
                 return self.respond_html(self.coach_athletes(user, "That athlete email already exists."), status=400)
-            handle_exists = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone() if username else None
-            if handle_exists:
-                username = f"{username}-{secrets.randbelow(900) + 100}"
+            username = unique_handle(conn, username)
             conn.execute(
                 "INSERT INTO users (username,email,password,role,name) VALUES (?,?,?,?,?)",
                 (
