@@ -24,9 +24,11 @@ SESSIONS: dict[str, dict[str, str]] = {}
 SESSION_TTL_SECONDS = 60 * 60 * 12
 FORCE_SECURE_COOKIE = os.getenv("BAYOU_COOKIE_SECURE", "false").lower() == "true"
 STATIC_DIR = BASE_DIR / "static"
+UPLOADS_DIR = STATIC_DIR / "uploads"
 TEMPLATES_DIR = BASE_DIR / "templates"
 HANDLE_SUFFIX_MIN = 100
 HANDLE_SUFFIX_SPAN = 900
+ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}
 
 
 def db_conn() -> sqlite3.Connection:
@@ -260,8 +262,21 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS coach_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coach_user_id INTEGER NOT NULL,
+                athlete_user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(coach_user_id) REFERENCES users(id),
+                FOREIGN KEY(athlete_user_id) REFERENCES users(id),
+                UNIQUE(coach_user_id, athlete_user_id)
+            );
             """
         )
+
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
         ensure_column(conn, "users", "is_admin", "INTEGER", "0")
         ensure_column(conn, "users", "locked", "INTEGER", "0")
@@ -388,6 +403,7 @@ def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
         "schools",
         "galleries",
         "site_settings",
+        "coach_invites",
     }
     if table not in allowed_tables:
         raise ValueError("Unsupported table name")
@@ -500,6 +516,57 @@ def optional_image_url(value: str) -> str:
     return ""
 
 
+def parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+    """Parse multipart/form-data body. Returns (fields, files) where files are (filename, bytes)."""
+    boundary_m = re.search(r"boundary=([^\s;,]+)", content_type)
+    if not boundary_m:
+        return {}, {}
+    boundary = boundary_m.group(1).strip('"').encode("latin-1")
+    fields: dict[str, str] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+    delimiter = b"--" + boundary
+    parts = body.split(delimiter)
+    for part in parts[1:]:
+        if part[:2] == b"--":
+            break
+        if part[:2] == b"\r\n":
+            part = part[2:]
+        if part[-2:] == b"\r\n":
+            part = part[:-2]
+        if b"\r\n\r\n" not in part:
+            continue
+        raw_headers, _, content = part.partition(b"\r\n\r\n")
+        header_map: dict[str, str] = {}
+        for line in raw_headers.decode("utf-8", "replace").split("\r\n"):
+            if ":" in line:
+                k, _, v = line.partition(":")
+                header_map[k.strip().lower()] = v.strip()
+        disp = header_map.get("content-disposition", "")
+        name_m = re.search(r'name="([^"]*)"', disp)
+        fname_m = re.search(r'filename="([^"]*)"', disp)
+        if not name_m:
+            continue
+        field_name = name_m.group(1)
+        if fname_m and fname_m.group(1):
+            files[field_name] = (fname_m.group(1), content)
+        else:
+            fields[field_name] = content.decode("utf-8", "replace")
+    return fields, files
+
+
+def save_upload(filename: str, data: bytes) -> str:
+    """Save an uploaded image file to UPLOADS_DIR. Returns the URL path or ''."""
+    if not data or not filename:
+        return ""
+    ext = Path(filename).suffix.lower()
+    if ext not in ALLOWED_UPLOAD_EXTS:
+        return ""
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    unique_name = f"{secrets.token_hex(16)}{ext}"
+    (UPLOADS_DIR / unique_name).write_bytes(data)
+    return f"/static/uploads/{unique_name}"
+
+
 def format_text_block(value: str, empty_message: str) -> str:
     text = value.strip()
     if not text:
@@ -548,10 +615,12 @@ def can_display_public_images(
     return False
 
 
-def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
+def html_page(title: str, body: str, user: sqlite3.Row | None = None, profile_colors: tuple[str, str] | None = None) -> str:
     primary = "#2563eb"
     secondary = "#0f172a"
-    if user and user["school_id"]:
+    if profile_colors:
+        primary, secondary = profile_colors
+    elif user and user["school_id"]:
         with db_conn() as conn:
             school = conn.execute("SELECT color_primary,color_secondary FROM schools WHERE id=?", (user["school_id"],)).fetchone()
             if school:
@@ -565,7 +634,7 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
                     "<a href='/admin'>Admin</a>",
                     "<a href='/search'>Search</a>",
                     f"<a href='/profile/{user['id']}'>Profile</a>",
-                    "<a href='/profile'>Edit Profile</a>",
+                    "<a href='/profile'>Settings</a>",
                     "<a href='/logout'>Logout</a>",
                 ]
             )
@@ -580,7 +649,6 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
                     "<a href='/coach/schools'>Schools</a>",
                     "<a href='/search'>Search</a>",
                     f"<a href='/profile/{user['id']}'>Profile</a>",
-                    "<a href='/profile'>Edit Profile</a>",
                     "<a href='/logout'>Logout</a>",
                 ]
             )
@@ -591,7 +659,6 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
                     "<a href='/athlete/progress'>Progress</a>",
                     "<a href='/search'>Search</a>",
                     f"<a href='/profile/{user['id']}'>Profile</a>",
-                    "<a href='/profile'>Edit Profile</a>",
                     "<a href='/logout'>Logout</a>",
                 ]
             )
@@ -615,7 +682,8 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None) -> str:
         <span class='site-brand-mark'>BB</span>
         <span><strong>Bayou Bombers</strong><small>Throws training hub</small></span>
       </a>
-      <nav class='site-nav'>{nav}</nav>
+      <button class='nav-toggle' aria-label='Toggle navigation' aria-expanded='false'>&#9776;</button>
+      <nav class='site-nav' id='site-nav'>{nav}</nav>
     </div>
   </header>
   <main class='page-shell'>{body}</main>
@@ -748,6 +816,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/coach/plans" and method == "POST":
             return self.add_plan(user)
 
+        if path == "/coach/athletes/search" and method == "GET":
+            return self.respond_html(self.coach_athlete_search(user, query.get("q", [""])[0]))
+
+        if path == "/coach/invite" and method == "POST":
+            return self.coach_send_invite(user)
+
         if path == "/coach/assign" and method == "POST":
             return self.assign_plan(user)
 
@@ -759,6 +833,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/athlete/progress":
             return self.respond_html(self.athlete_progress(user))
+
+        if path == "/athlete/invite/respond" and method == "POST":
+            return self.respond_invite(user)
 
         if path.startswith("/athlete/assignment/") and path.endswith("/complete") and method == "POST":
             return self.complete_assignment(user, path)
@@ -802,11 +879,18 @@ class AppHandler(BaseHTTPRequestHandler):
         for token in expired:
             SESSIONS.pop(token, None)
 
-    def read_form(self) -> dict[str, str]:
+    def read_form_with_files(self) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+        content_type = self.headers.get("Content-Type", "")
         length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length).decode("utf-8")
-        parsed = parse_qs(raw)
-        return {k: v[0] for k, v in parsed.items()}
+        raw = self.rfile.read(length)
+        if "multipart/form-data" in content_type:
+            return parse_multipart(content_type, raw)
+        fields = {k: v[0] for k, v in parse_qs(raw.decode("utf-8")).items()}
+        return fields, {}
+
+    def read_form(self) -> dict[str, str]:
+        fields, _ = self.read_form_with_files()
+        return fields
 
     def respond_html(self, content: str, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
         payload = content.encode("utf-8")
@@ -1003,31 +1087,54 @@ class AppHandler(BaseHTTPRequestHandler):
                 (target["id"],),
             ).fetchall()
             hide_minor_images = setting_bool(conn, "hide_minor_images_public", True)
+            # Athlete-specific: meet results and coach info
+            meet_results_rows: list[sqlite3.Row] = []
+            coach_info: sqlite3.Row | None = None
+            if target["role"] == "athlete":
+                athlete_rec = conn.execute("SELECT id, coach_user_id FROM athletes WHERE user_id=?", (target["id"],)).fetchone()
+                if athlete_rec:
+                    meet_results_rows = conn.execute(
+                        "SELECT meet_name,event,feet,inches,meters,meet_date FROM meet_results WHERE athlete_id=? ORDER BY meet_date DESC, id DESC LIMIT 20",
+                        (athlete_rec["id"],),
+                    ).fetchall()
+                    if athlete_rec["coach_user_id"]:
+                        coach_info = conn.execute("SELECT id,name FROM users WHERE id=? AND role='coach'", (athlete_rec["coach_user_id"],)).fetchone()
+
+        # Use profile owner's school colors if available
+        prof_primary = target["color_primary"] if target["color_primary"] else "#2563eb"
+        prof_secondary = target["color_secondary"] if target["color_secondary"] else "#0f172a"
+        profile_colors = (prof_primary, prof_secondary)
+
         can_show_images = can_display_public_images(target, current_user, hide_minor_images, is_owner)
         profile_img = target["profile_image_url"] if can_show_images and target["profile_image_url"] else "/static/default-avatar.svg"
         school_symbol = f"<img class='school-symbol' src='{esc(target['symbol_url'])}' alt='school symbol'>" if target["symbol_url"] else ""
+        coach_html = (
+            f"<p>Coach: <a href='/profile/{coach_info['id']}'>{esc(coach_info['name'])}</a></p>"
+            if coach_info
+            else ""
+        )
         owner_tools = ""
         if is_owner:
             owner_tools = f"""
             <div class='profile-owner-tools'>
               <a class='btn' href='/profile'>Edit Profile</a>
-              <a class='btn secondary' href='{esc(dashboard_path(target))}'>Open Dashboard</a>
+              <a class='btn secondary' href='{esc(dashboard_path(target))}'>Dashboard</a>
             </div>
             <div class='grid profile-owner-grid'>
               <div class='card'>
                 <h3>Post Status Update</h3>
-                <form method='post' action='/profile/status'>
+                <form method='post' action='/profile/status' enctype='multipart/form-data'>
                   <label>Update<textarea name='body' required></textarea></label>
-                  <label>Status Image URL<input name='image_url' placeholder='Optional https:// image URL'></label>
+                  <label>Image (optional)<input type='file' name='image' accept='image/*'></label>
                   <button type='submit'>Post Update</button>
                 </form>
               </div>
               <div class='card'>
                 <h3>Add Gallery Photo</h3>
-                <form method='post' action='/profile/gallery'>
-                  <label>Image URL<input name='image_url' required placeholder='https://example.com/photo.jpg'></label>
+                <form method='post' action='/profile/gallery' enctype='multipart/form-data'>
+                  <label>Photo<input type='file' name='image' accept='image/*' required></label>
                   <label>Caption<input name='caption'></label>
-                  <button type='submit'>Add Photo</button>
+                  <button type='submit'>Upload Photo</button>
                 </form>
               </div>
             </div>
@@ -1042,6 +1149,15 @@ class AppHandler(BaseHTTPRequestHandler):
         )
         if not gallery_html:
             gallery_html = "<p class='muted'>No gallery photos.</p>"
+
+        meet_feed_html = ""
+        if meet_results_rows:
+            meet_rows = "".join(
+                f"<tr><td>{esc(m['meet_date'])}</td><td>{esc(m['meet_name'])}</td><td>{esc(m['event'])}</td><td>{m['feet']}' {m['inches']}\"</td><td>{m['meters']}m</td></tr>"
+                for m in meet_results_rows
+            )
+            meet_feed_html = f"<div class='card' style='margin-top:12px'><h3>Meet Results</h3><table><tr><th>Date</th><th>Meet</th><th>Event</th><th>Distance</th><th>Meters</th></tr>{meet_rows}</table></div>"
+
         body = f"""
         <div class='card school-accent'>
           <div class='profile-head'>
@@ -1050,6 +1166,7 @@ class AppHandler(BaseHTTPRequestHandler):
               <h2>{esc(target['name'])} {school_symbol}</h2>
               <p class='muted'>{('@' + esc(target['username'])) if target['username'] else esc(target['role']).title()} {'• ' + esc(target['school_name']) if target['school_name'] else ''}</p>
               {format_text_block(target['status_text'] or '', 'No headline status yet.')}
+              {coach_html}
             </div>
           </div>
           {format_text_block(target['bio'] or '', 'No bio provided.')}
@@ -1062,10 +1179,11 @@ class AppHandler(BaseHTTPRequestHandler):
           </div>
           {owner_tools}
         </div>
+        {meet_feed_html}
         <div class='card' style='margin-top:12px'><h3>Status Feed</h3>{render_status_feed(statuses)}</div>
         <div class='card' style='margin-top:12px'><h3>Gallery</h3><div class='gallery'>{gallery_html}</div></div>
         """
-        return html_page("Public Profile", body, current_user)
+        return html_page("Public Profile", body, current_user, profile_colors=profile_colors)
 
     def my_profile(self, user: sqlite3.Row, error_message: str = "") -> str:
         with db_conn() as conn:
@@ -1096,7 +1214,7 @@ class AppHandler(BaseHTTPRequestHandler):
               </div>
               <a class='btn secondary' href='/profile/{user["id"]}'>View Public Profile</a>
             </div>
-            <form method='post' action='/profile'>
+            <form method='post' action='/profile' enctype='multipart/form-data'>
               <label>Name<input name='name' value='{esc(user['name'])}' required></label>
               <div class='row'>
                 <label>Email<input type='email' name='email' value='{esc(user['email'] or '')}' required></label>
@@ -1104,7 +1222,7 @@ class AppHandler(BaseHTTPRequestHandler):
               </div>
               <label>Headline Status<input name='status_text' value='{esc(user['status_text'] or '')}'></label>
               <label>Bio<textarea name='bio'>{esc(user['bio'] or '')}</textarea></label>
-              <label>Profile Image URL<input name='profile_image_url' value='{esc(user['profile_image_url'] or '')}' placeholder='https://example.com/avatar.jpg'></label>
+              <label>Profile Photo{(' — current: <img src="' + esc(user['profile_image_url']) + '" style="height:40px;border-radius:8px;vertical-align:middle">') if user['profile_image_url'] else ''}<input type='file' name='profile_image' accept='image/*'></label>
               <div class='row'>
                 <label>Grade Level<input name='grade_level' value='{esc(user['grade_level'] or '')}'></label>
                 <label>Age<input type='number' min='1' max='99' name='age' value='{esc(user['age'] or '')}'></label>
@@ -1126,18 +1244,18 @@ class AppHandler(BaseHTTPRequestHandler):
           <div class='stack'>
             <div class='card'>
               <h3>Share an Update</h3>
-              <form method='post' action='/profile/status'>
+              <form method='post' action='/profile/status' enctype='multipart/form-data'>
                 <label>Update<textarea name='body' required></textarea></label>
-                <label>Status Image URL<input name='image_url' placeholder='Optional https:// image URL'></label>
+                <label>Image (optional)<input type='file' name='image' accept='image/*'></label>
                 <button type='submit'>Post Update</button>
               </form>
             </div>
             <div class='card'>
               <h3>Gallery Uploads</h3>
-              <form method='post' action='/profile/gallery'>
-                <label>Image URL<input name='image_url' required placeholder='https://example.com/photo.jpg'></label>
+              <form method='post' action='/profile/gallery' enctype='multipart/form-data'>
+                <label>Photo<input type='file' name='image' accept='image/*' required></label>
                 <label>Caption<input name='caption'></label>
-                <button type='submit'>Add Photo</button>
+                <button type='submit'>Upload Photo</button>
               </form>
               <div style='margin-top:12px'>{photo_rows}</div>
             </div>
@@ -1151,12 +1269,19 @@ class AppHandler(BaseHTTPRequestHandler):
         return html_page("My Profile", body, user)
 
     def update_profile(self, user: sqlite3.Row) -> None:
-        form = self.read_form()
+        form, files = self.read_form_with_files()
         school_name = form.get("school_name", "").strip()
         email = normalize_email(form.get("email", ""))
         username = form.get("username", "").strip()
         if not is_valid_email(email):
             return self.respond_html(self.my_profile(user, "Enter a valid email address."), status=400)
+        # Handle profile image upload
+        new_image_url = user["profile_image_url"] or ""
+        if "profile_image" in files:
+            fname, fdata = files["profile_image"]
+            saved = save_upload(fname, fdata)
+            if saved:
+                new_image_url = saved
         with db_conn() as conn:
             email_exists = conn.execute("SELECT id FROM users WHERE email=? AND id<>?", (email, user["id"])).fetchone()
             if email_exists:
@@ -1181,7 +1306,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         email,
                         form.get("status_text", "").strip(),
                         form.get("bio", "").strip(),
-                        optional_image_url(form.get("profile_image_url", "")),
+                        new_image_url,
                         form.get("grade_level", "").strip(),
                         to_int(form.get("age", "0"), 0) or None,
                         form.get("height", "").strip(),
@@ -1198,20 +1323,27 @@ class AppHandler(BaseHTTPRequestHandler):
         self.redirect("/profile")
 
     def add_status_update(self, user: sqlite3.Row) -> None:
-        form = self.read_form()
+        form, files = self.read_form_with_files()
         body = form.get("body", "").strip()
         if not body:
             return self.redirect(f"/profile/{user['id']}")
+        image_url = ""
+        if "image" in files:
+            fname, fdata = files["image"]
+            image_url = save_upload(fname, fdata)
         with db_conn() as conn:
             conn.execute(
                 "INSERT INTO status_updates (user_id, body, image_url, created_at) VALUES (?,?,?,?)",
-                (user["id"], body, optional_image_url(form.get("image_url", "")), utc_now().isoformat(timespec="seconds")),
+                (user["id"], body, image_url, utc_now().isoformat(timespec="seconds")),
             )
         self.redirect(f"/profile/{user['id']}")
 
     def add_gallery_photo(self, user: sqlite3.Row) -> None:
-        form = self.read_form()
-        image_url = optional_image_url(form.get("image_url", ""))
+        form, files = self.read_form_with_files()
+        image_url = ""
+        if "image" in files:
+            fname, fdata = files["image"]
+            image_url = save_upload(fname, fdata)
         if not image_url:
             return self.redirect(f"/profile/{user['id']}")
         with db_conn() as conn:
@@ -1323,21 +1455,30 @@ class AppHandler(BaseHTTPRequestHandler):
     def coach_schools(self, user: sqlite3.Row) -> str:
         with db_conn() as conn:
             schools = conn.execute("SELECT * FROM schools WHERE coach_user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
-        rows = "".join(
-            f"<tr><td>{esc(s['name'])}</td><td>{esc(s['color_primary'])}</td><td>{esc(s['color_secondary'])}</td><td>{esc(s['symbol_url'])}</td></tr>"
-            for s in schools
-        ) or "<tr><td colspan='4' class='muted'>No schools yet.</td></tr>"
+        school_rows = []
+        for s in schools:
+            cp = esc(s["color_primary"])
+            cs = esc(s["color_secondary"])
+            sym = f'<img src="{esc(s["symbol_url"])}" style="height:28px">' if s["symbol_url"] else "—"
+            swatch_style = "display:inline-block;width:20px;height:20px;border-radius:4px;border:1px solid #ccc;vertical-align:middle"
+            school_rows.append(
+                f"<tr><td>{esc(s['name'])}</td>"
+                f"<td><span style='{swatch_style};background:{cp}'></span> {cp}</td>"
+                f"<td><span style='{swatch_style};background:{cs}'></span> {cs}</td>"
+                f"<td>{sym}</td></tr>"
+            )
+        rows = "".join(school_rows) or "<tr><td colspan='4' class='muted'>No schools yet.</td></tr>"
         body = f"""
         <div class='grid'>
           <div class='card'>
             <h3>Create School</h3>
-            <form method='post' action='/coach/schools'>
+            <form method='post' action='/coach/schools' enctype='multipart/form-data'>
               <label>School Name<input name='name' required></label>
               <div class='row'>
                 <label>Primary Color<input type='color' name='color_primary' value='#2563eb'></label>
                 <label>Secondary Color<input type='color' name='color_secondary' value='#0f172a'></label>
               </div>
-              <label>School Symbol URL<input name='symbol_url'></label>
+              <label>School Symbol / Logo<input type='file' name='symbol' accept='image/*'></label>
               <button type='submit'>Save School</button>
             </form>
           </div>
@@ -1347,10 +1488,14 @@ class AppHandler(BaseHTTPRequestHandler):
         return html_page("Schools", body, user)
 
     def add_school(self, user: sqlite3.Row) -> None:
-        form = self.read_form()
+        form, files = self.read_form_with_files()
         name = form.get("name", "").strip()
         if not name:
             return self.redirect("/coach/schools")
+        symbol_url = ""
+        if "symbol" in files:
+            fname, fdata = files["symbol"]
+            symbol_url = save_upload(fname, fdata)
         with db_conn() as conn:
             existing = conn.execute("SELECT id FROM schools WHERE name=?", (name,)).fetchone()
             if existing:
@@ -1362,7 +1507,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     name,
                     form.get("color_primary", "#2563eb"),
                     form.get("color_secondary", "#0f172a"),
-                    form.get("symbol_url", "").strip(),
+                    symbol_url,
                 ),
             )
         self.redirect("/coach/schools")
@@ -1469,38 +1614,62 @@ class AppHandler(BaseHTTPRequestHandler):
                 SELECT a.id, COALESCE(u.name,'Unlinked') AS name, COALESCE(u.username,'(none)') AS username,
                        COALESCE(u.email,'') AS email,
                        a.sex, a.events, COALESCE(a.group_name,'') AS group_name,
-                       u.profile_private, u.force_private, u.id AS user_id, COALESCE(s.name,'') AS school_name
+                       u.profile_private, u.force_private, u.id AS user_id, COALESCE(s.name,'') AS school_name,
+                       s.id AS school_id_current
                 FROM athletes a
                 LEFT JOIN users u ON u.id=a.user_id
                 LEFT JOIN schools s ON s.id=u.school_id
+                WHERE a.coach_user_id=?
                 ORDER BY name
-                """
+                """,
+                (user["id"],),
             ).fetchall()
             school_choices = conn.execute("SELECT id,name FROM schools WHERE coach_user_id=? ORDER BY name", (user["id"],)).fetchall()
 
         school_options = "".join(f"<option value='{s['id']}'>{esc(s['name'])}</option>" for s in school_choices)
-        rows = "".join(
-            f"<tr><td>{r['id']}</td><td>{esc(r['name'])}</td><td>{esc(r['email'])}</td><td>{esc(r['username'])}</td>"
-            f"<td>{esc(r['school_name'])}</td><td>{'Yes' if r['profile_private'] or r['force_private'] else 'No'}</td>"
-            f"<td><form method='post' action='/coach/athlete/privacy' class='inline'>"
-            f"<input type='hidden' name='athlete_id' value='{r['id']}'><select name='force_private'><option value='0'>Public</option><option value='1' {'selected' if r['force_private'] else ''}>Force Private</option></select><button type='submit'>Save</button></form>"
-            f"<form method='post' action='/coach/athlete/school' class='inline'>"
-            f"<input type='hidden' name='user_id' value='{r['user_id']}'><select name='school_id'><option value=''>No School</option>{school_options}</select><button type='submit'>Set School</button></form></td></tr>"
-            for r in athletes
-        ) or "<tr><td colspan='6' class='muted'>No athletes yet.</td></tr>"
 
-        error_html = f"<div class='card'>{esc(error_message)}</div>" if error_message else ""
+        rows = []
+        for r in athletes:
+            selected_school = "".join(
+                f"<option value='{s['id']}' {'selected' if r['school_id_current'] == s['id'] else ''}>{esc(s['name'])}</option>"
+                for s in school_choices
+            )
+            rows.append(
+                f"<tr>"
+                f"<td><a href='/profile/{r['user_id']}'>{esc(r['name'])}</a></td>"
+                f"<td>{esc(r['email'])}</td>"
+                f"<td>{esc(r['events'])}</td>"
+                f"<td>{esc(r['school_name']) or '—'}</td>"
+                f"<td>{'🔒' if r['profile_private'] or r['force_private'] else '🔓'}</td>"
+                f"<td class='roster-actions'>"
+                f"<form method='post' action='/coach/athlete/privacy'>"
+                f"<input type='hidden' name='athlete_id' value='{r['id']}'>"
+                f"<select name='force_private'><option value='0'>Public</option><option value='1' {'selected' if r['force_private'] else ''}>Force Private</option></select>"
+                f"<button type='submit' class='btn-small'>Privacy</button></form>"
+                f"<form method='post' action='/coach/athlete/school'>"
+                f"<input type='hidden' name='user_id' value='{r['user_id']}'>"
+                f"<select name='school_id'><option value=''>No School</option>{selected_school}</select>"
+                f"<button type='submit' class='btn-small'>School</button></form>"
+                f"</td></tr>"
+            )
+        roster_html = "".join(rows) or "<tr><td colspan='6' class='muted'>No athletes in your roster. Use 'Add Athlete' or invite athletes via search.</td></tr>"
+
+        error_html = f"<div class='notice card'>{esc(error_message)}</div>" if error_message else ""
 
         body = f"""
         {error_html}
+        <div class='section-head'>
+          <h2>Athlete Roster</h2>
+          <a class='btn secondary' href='/coach/athletes/search'>Search &amp; Invite Athletes</a>
+        </div>
         <div class='grid'>
           <div class='card'>
-            <h3>Add Athlete</h3>
+            <h3>Create New Athlete Account</h3>
             <form method='post' action='/coach/athletes'>
               <label>Name<input name='name' required></label>
               <div class='row'>
                 <label>Email<input type='email' name='email' required></label>
-                <label>Handle<input name='username' placeholder='Optional public handle'></label>
+                <label>Handle<input name='username' placeholder='Optional'></label>
               </div>
               <label>Password<input type='password' name='password' required></label>
               <div class='row'>
@@ -1511,16 +1680,16 @@ class AppHandler(BaseHTTPRequestHandler):
               <button type='submit'>Create Athlete</button>
             </form>
           </div>
-          <div class='card'>
-            <h3>Athlete Roster</h3>
-            <table>
-              <tr><th>ID</th><th>Name</th><th>Email</th><th>Handle</th><th>School</th><th>Private</th><th>Controls</th></tr>
-              {rows}
+          <div class='card' style='overflow-x:auto'>
+            <h3>Roster</h3>
+            <table class='roster-table'>
+              <tr><th>Name</th><th>Email</th><th>Events</th><th>School</th><th>Privacy</th><th>Actions</th></tr>
+              {roster_html}
             </table>
           </div>
         </div>
         """
-        return html_page("Athlete Setup", body, user)
+        return html_page("Athlete Roster", body, user)
 
     def add_athlete(self, user: sqlite3.Row) -> None:
         form = self.read_form()
@@ -1533,15 +1702,19 @@ class AppHandler(BaseHTTPRequestHandler):
             if exists:
                 return self.respond_html(self.coach_athletes(user, "That athlete email already exists."), status=400)
             username = unique_handle(conn, username)
+            # Apply coach's school to the new athlete if coach has one
+            coach_school = conn.execute("SELECT school_id FROM users WHERE id=?", (user["id"],)).fetchone()
+            athlete_school_id = coach_school["school_id"] if coach_school and coach_school["school_id"] else None
             try:
                 conn.execute(
-                    "INSERT INTO users (username,email,password,role,name) VALUES (?,?,?,?,?)",
+                    "INSERT INTO users (username,email,password,role,name,school_id) VALUES (?,?,?,?,?,?)",
                     (
                         username,
                         email,
                         hash_password(form.get("password", "athlete123")),
                         "athlete",
                         form.get("name", "Athlete"),
+                        athlete_school_id,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -1552,6 +1725,107 @@ class AppHandler(BaseHTTPRequestHandler):
                 (user_id, form.get("sex", "Male"), form.get("events", "Shot Put"), form.get("group_name", ""), user["id"]),
             )
         self.redirect("/coach/athletes")
+
+    def coach_athlete_search(self, user: sqlite3.Row, q: str = "") -> str:
+        term = q.strip().lower()
+        with db_conn() as conn:
+            # Search ALL athletes (including hidden), excluding those already in coach's roster
+            all_athletes = conn.execute(
+                """
+                SELECT u.id, u.name, u.username, u.email, u.profile_private, u.force_private,
+                       a.id AS athlete_id, a.events, a.coach_user_id,
+                       COALESCE(ci.status,'') AS invite_status
+                FROM athletes a
+                JOIN users u ON u.id=a.user_id
+                LEFT JOIN coach_invites ci ON ci.athlete_user_id=u.id AND ci.coach_user_id=?
+                WHERE u.locked=0 AND (a.coach_user_id IS NULL OR a.coach_user_id!=?)
+                ORDER BY u.name
+                """,
+                (user["id"], user["id"]),
+            ).fetchall()
+        cards = []
+        for row in all_athletes:
+            haystack = f"{(row['name'] or '').lower()} {(row['username'] or '').lower()} {(row['email'] or '').lower()}"
+            if term and term not in haystack:
+                continue
+            invite_status = row["invite_status"]
+            if invite_status == "pending":
+                action_html = "<span class='tag'>Invite Pending</span>"
+            elif invite_status == "accepted":
+                action_html = "<span class='tag'>Already on roster</span>"
+            else:
+                action_html = (
+                    f"<form method='post' action='/coach/invite'>"
+                    f"<input type='hidden' name='athlete_user_id' value='{row['id']}'>"
+                    f"<button type='submit' class='btn-small'>Invite</button></form>"
+                )
+            privacy_badge = " <span class='tag' style='font-size:0.75rem'>Private</span>" if row["profile_private"] or row["force_private"] else ""
+            cards.append(
+                f"<div class='card'><div class='profile-head'>"
+                f"<div><h4>{esc(row['name'])}{privacy_badge}</h4>"
+                f"<p class='muted'>{esc(row['events'] or '')}</p></div>"
+                f"</div>{action_html}</div>"
+            )
+        cards_html = "".join(cards) or "<div class='card muted'>No athletes found.</div>"
+        body = (
+            "<div class='section-head'><h2>Search &amp; Invite Athletes</h2>"
+            f"<a class='btn secondary' href='/coach/athletes'>Back to Roster</a></div>"
+            "<div class='card'><form method='get' action='/coach/athletes/search'><div class='inline'>"
+            f"<input name='q' value='{esc(q)}' placeholder='Search by name, handle or email'>"
+            "<button type='submit'>Search</button></div></form>"
+            "<p class='muted'>This list shows athletes not yet on your roster. Private athletes are also shown here.</p></div>"
+            f"<div class='grid' style='margin-top:12px'>{cards_html}</div>"
+        )
+        return html_page("Search Athletes", body, user)
+
+    def coach_send_invite(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        athlete_user_id = to_int(form.get("athlete_user_id", "0"), 0)
+        if not athlete_user_id:
+            return self.redirect("/coach/athletes/search")
+        with db_conn() as conn:
+            target = conn.execute("SELECT id FROM users WHERE id=? AND role='athlete'", (athlete_user_id,)).fetchone()
+            if target is None:
+                return self.redirect("/coach/athletes/search")
+            # Check athlete is not already on this coach's roster
+            already = conn.execute(
+                "SELECT id FROM athletes WHERE user_id=? AND coach_user_id=?", (athlete_user_id, user["id"])
+            ).fetchone()
+            if already:
+                return self.redirect("/coach/athletes")
+            try:
+                conn.execute(
+                    "INSERT INTO coach_invites (coach_user_id, athlete_user_id, status, created_at) VALUES (?,?,?,?)",
+                    (user["id"], athlete_user_id, "pending", utc_now().isoformat(timespec="seconds")),
+                )
+            except sqlite3.IntegrityError:
+                pass  # invite already exists
+        self.redirect("/coach/athletes/search")
+
+    def respond_invite(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        invite_id = to_int(form.get("invite_id", "0"), 0)
+        action = form.get("action", "")
+        with db_conn() as conn:
+            invite = conn.execute(
+                "SELECT * FROM coach_invites WHERE id=? AND athlete_user_id=? AND status='pending'",
+                (invite_id, user["id"]),
+            ).fetchone()
+            if invite is None:
+                return self.redirect("/athlete")
+            if action == "accept":
+                conn.execute("UPDATE coach_invites SET status='accepted' WHERE id=?", (invite_id,))
+                # Set the athlete's coach_user_id
+                athlete_rec = conn.execute("SELECT id FROM athletes WHERE user_id=?", (user["id"],)).fetchone()
+                if athlete_rec:
+                    conn.execute("UPDATE athletes SET coach_user_id=? WHERE id=?", (invite["coach_user_id"], athlete_rec["id"]))
+                # Apply coach's school to athlete
+                coach_school = conn.execute("SELECT school_id FROM users WHERE id=?", (invite["coach_user_id"],)).fetchone()
+                if coach_school and coach_school["school_id"]:
+                    conn.execute("UPDATE users SET school_id=? WHERE id=?", (coach_school["school_id"], user["id"]))
+            else:
+                conn.execute("UPDATE coach_invites SET status='denied' WHERE id=?", (invite_id,))
+        self.redirect("/athlete")
 
     def coach_modules(self, user: sqlite3.Row) -> str:
         with db_conn() as conn:
@@ -1776,6 +2050,33 @@ class AppHandler(BaseHTTPRequestHandler):
                     """,
                     (ass["assignment_id"],),
                 ).fetchall()
+            # Pending coach invites
+            pending_invites = conn.execute(
+                """
+                SELECT ci.id, ci.coach_user_id, u.name AS coach_name
+                FROM coach_invites ci
+                JOIN users u ON u.id=ci.coach_user_id
+                WHERE ci.athlete_user_id=? AND ci.status='pending'
+                ORDER BY ci.created_at DESC
+                """,
+                (user["id"],),
+            ).fetchall()
+
+        invite_banners = "".join(
+            f"<div class='invite-banner card notice'>"
+            f"<p>🏅 Coach <strong>{esc(inv['coach_name'])}</strong> wants to add you to their roster.</p>"
+            f"<div class='inline'>"
+            f"<form method='post' action='/athlete/invite/respond'>"
+            f"<input type='hidden' name='invite_id' value='{inv['id']}'>"
+            f"<input type='hidden' name='action' value='accept'>"
+            f"<button type='submit'>Accept</button></form>"
+            f"<form method='post' action='/athlete/invite/respond'>"
+            f"<input type='hidden' name='invite_id' value='{inv['id']}'>"
+            f"<input type='hidden' name='action' value='deny'>"
+            f"<button type='submit' class='secondary'>Deny</button></form>"
+            f"</div></div>"
+            for inv in pending_invites
+        )
 
         assignment_cards = []
         for ass in assignments:
@@ -1797,12 +2098,14 @@ class AppHandler(BaseHTTPRequestHandler):
 
         assignments_html = "".join(assignment_cards) if assignment_cards else "<div class='card'>No assignments yet.</div>"
         body = f"""
+        {invite_banners}
         <div class='card'>
-          <h3>Welcome {esc(user['name'])}</h3>
+          <h3>Welcome back, {esc(user['name'])}</h3>
           <p class='muted'>Events: {esc(athlete['events'])} | Group: {esc(athlete['group_name'] or 'N/A')}</p>
         </div>
         <div class='grid' style='margin-top:12px'>
           <div>
+            <h3 style='margin:0 0 10px'>Assignments</h3>
             {assignments_html}
           </div>
           <div>
