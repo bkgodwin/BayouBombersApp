@@ -30,6 +30,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 HANDLE_SUFFIX_MIN = 100
 HANDLE_SUFFIX_SPAN = 900
 ALLOWED_UPLOAD_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}
+SAFE_REDIRECT_RE = re.compile(r"^/[A-Za-z0-9/_?=&.%+-]*$")
 
 
 def db_conn() -> sqlite3.Connection:
@@ -442,7 +443,7 @@ def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str, default_sql: str = "") -> None:
-    if table not in {"users", "athletes", "training_modules", "practice_plans"}:
+    if table not in {"users", "athletes", "training_modules", "practice_plans", "calendar_events"}:
         raise ValueError("Unsupported table for schema alteration")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
         raise ValueError("Invalid column name")
@@ -892,6 +893,19 @@ def render_calendar(entries: list[dict[str, str]], month_value: str, base_path: 
             "</div>"
         )
 
+    weekday_headers = "".join(
+        f"<span aria-label='{full}'>{short}</span>"
+        for short, full in (
+            ("Mon", "Monday"),
+            ("Tue", "Tuesday"),
+            ("Wed", "Wednesday"),
+            ("Thu", "Thursday"),
+            ("Fri", "Friday"),
+            ("Sat", "Saturday"),
+            ("Sun", "Sunday"),
+        )
+    )
+
     return f"""
     <section class='card calendar-widget'>
       <div class='section-head'>
@@ -913,9 +927,7 @@ def render_calendar(entries: list[dict[str, str]], month_value: str, base_path: 
       </div>
       <div class='calendar-shell'>
         <div>
-          <div class='calendar-weekdays'>
-            <span aria-label='Monday'>Mon</span><span aria-label='Tuesday'>Tue</span><span aria-label='Wednesday'>Wed</span><span aria-label='Thursday'>Thu</span><span aria-label='Friday'>Fri</span><span aria-label='Saturday'>Sat</span><span aria-label='Sunday'>Sun</span>
-          </div>
+          <div class='calendar-weekdays'>{weekday_headers}</div>
           <div class='calendar-grid'>{"".join(cells)}</div>
         </div>
         <div class='calendar-detail-area'>{"".join(detail_panels)}</div>
@@ -1132,25 +1144,24 @@ class AppHandler(BaseHTTPRequestHandler):
         fields, _ = self.read_form_with_files()
         return fields
 
-    def respond_html(self, content: str, status: int = 200, extra_headers: dict[str, str] | None = None) -> None:
+    def respond_html(self, content: str, status: int = 200) -> None:
         payload = content.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
-        if extra_headers:
-            for key, value in extra_headers.items():
-                self.send_header(key, safe_header_value(value))
         self.end_headers()
         self.wfile.write(payload)
 
     def redirect(self, location: str, cookie_header: str | None = None) -> None:
         safe_location = safe_header_value(location).strip() or "/"
-        if not safe_location.startswith("/"):
+        if not SAFE_REDIRECT_RE.fullmatch(safe_location):
             safe_location = "/"
-        headers = {"Location": safe_location}
+        self.send_response(302)
+        self.send_header("Location", safe_location)
         if cookie_header:
-            headers["Set-Cookie"] = cookie_header
-        self.respond_html("", status=302, extra_headers=headers)
+            self.send_header("Set-Cookie", safe_header_value(cookie_header))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def respond_bytes(self, payload: bytes, content_type: str, status: int = 200) -> None:
         self.send_response(status)

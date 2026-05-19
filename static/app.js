@@ -122,8 +122,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!planType || !categoryInput) return;
 
     planType.addEventListener('change', () => {
-      if (planType.value === 'weight_room' && !categoryInput.value.trim()) categoryInput.value = WEIGHT_ROOM_LABEL;
-      if (planType.value === 'practice' && categoryInput.value.trim().toLowerCase() === WEIGHT_ROOM_LABEL.toLowerCase()) categoryInput.value = 'Technique';
+      const normalizedCategory = categoryInput.value.trim().toLowerCase();
+      const normalizedWeightRoomLabel = WEIGHT_ROOM_LABEL.trim().toLowerCase();
+      if (planType.value === 'weight_room' && !normalizedCategory) categoryInput.value = WEIGHT_ROOM_LABEL;
+      if (planType.value === 'practice' && normalizedCategory === normalizedWeightRoomLabel) categoryInput.value = 'Technique';
     });
   });
 });
