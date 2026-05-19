@@ -602,7 +602,7 @@ def format_text_block(value: str, empty_message: str) -> str:
 
 
 def safe_header_value(value: str) -> str:
-    return str(value).replace("\r", "").replace("\n", "")
+    return "".join(ch for ch in str(value) if ch >= " " and ch != "\x7f")
 
 
 def dashboard_path(user: sqlite3.Row) -> str:
