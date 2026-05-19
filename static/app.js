@@ -1,4 +1,6 @@
 document.addEventListener('DOMContentLoaded', () => {
+  const WEIGHT_ROOM_LABEL = 'Weight Room';
+
   document.querySelectorAll('form').forEach((form) => {
     form.addEventListener('submit', (event) => {
       const btn = form.querySelector('button[type="submit"]:not([formaction])');
@@ -120,8 +122,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!planType || !categoryInput) return;
 
     planType.addEventListener('change', () => {
-      if (planType.value === 'weight_room' && !categoryInput.value.trim()) categoryInput.value = 'Weight Room';
-      if (planType.value === 'practice' && categoryInput.value.trim().toLowerCase() === 'weight room') categoryInput.value = 'Technique';
+      if (planType.value === 'weight_room' && !categoryInput.value.trim()) categoryInput.value = WEIGHT_ROOM_LABEL;
+      if (planType.value === 'practice' && categoryInput.value.trim().toLowerCase() === WEIGHT_ROOM_LABEL.toLowerCase()) categoryInput.value = 'Technique';
     });
   });
 });

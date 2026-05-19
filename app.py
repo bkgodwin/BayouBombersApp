@@ -601,6 +601,10 @@ def format_text_block(value: str, empty_message: str) -> str:
     return "<p>" + esc(text).replace("\n", "<br>") + "</p>"
 
 
+def safe_header_value(value: str) -> str:
+    return str(value).replace("\r", "").replace("\n", "")
+
+
 def dashboard_path(user: sqlite3.Row) -> str:
     if user["is_admin"]:
         return "/admin"
@@ -855,6 +859,7 @@ def render_calendar(entries: list[dict[str, str]], month_value: str, base_path: 
     cells = ["<div class='calendar-day empty'></div>" for _ in range(first_weekday)]
     for day_number in range(1, days_in_month + 1):
         day_value = date(current_month.year, current_month.month, day_number).isoformat()
+        day_label = datetime.strptime(day_value, "%Y-%m-%d").strftime("%A, %B %d, %Y")
         details = grouped.get(day_value, {"types": set(), "cards": []})
         dot_types = sorted(details["types"]) if isinstance(details["types"], set) else []
         dot_html = "".join(
@@ -863,7 +868,7 @@ def render_calendar(entries: list[dict[str, str]], month_value: str, base_path: 
         )
         has_events = bool(dot_types)
         cells.append(
-            f"<button type='button' class='calendar-day{' has-events' if has_events else ''}' data-calendar-date='{day_value}'>"
+            f"<button type='button' class='calendar-day{' has-events' if has_events else ''}' data-calendar-date='{day_value}' aria-label='{esc(day_label)}'>"
             f"<span class='calendar-day-number'>{day_number}</span>"
             f"<span class='calendar-day-dots'>{dot_html}</span>"
             "</button>"
@@ -909,7 +914,7 @@ def render_calendar(entries: list[dict[str, str]], month_value: str, base_path: 
       <div class='calendar-shell'>
         <div>
           <div class='calendar-weekdays'>
-            <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+            <span aria-label='Monday'>Mon</span><span aria-label='Tuesday'>Tue</span><span aria-label='Wednesday'>Wed</span><span aria-label='Thursday'>Thu</span><span aria-label='Friday'>Fri</span><span aria-label='Saturday'>Sat</span><span aria-label='Sunday'>Sun</span>
           </div>
           <div class='calendar-grid'>{"".join(cells)}</div>
         </div>
@@ -1134,12 +1139,15 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         if extra_headers:
             for key, value in extra_headers.items():
-                self.send_header(key, value)
+                self.send_header(key, safe_header_value(value))
         self.end_headers()
         self.wfile.write(payload)
 
     def redirect(self, location: str, cookie_header: str | None = None) -> None:
-        headers = {"Location": location}
+        safe_location = safe_header_value(location).strip() or "/"
+        if not safe_location.startswith("/"):
+            safe_location = "/"
+        headers = {"Location": safe_location}
         if cookie_header:
             headers["Set-Cookie"] = cookie_header
         self.respond_html("", status=302, extra_headers=headers)
