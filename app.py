@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import base64
 import html
 import hmac
@@ -273,6 +274,16 @@ def init_db() -> None:
                 FOREIGN KEY(athlete_user_id) REFERENCES users(id),
                 UNIQUE(coach_user_id, athlete_user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS calendar_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                created_by INTEGER NOT NULL,
+                FOREIGN KEY(created_by) REFERENCES users(id)
+            );
             """
         )
 
@@ -294,7 +305,14 @@ def init_db() -> None:
         ensure_column(conn, "users", "profile_image_url", "TEXT", "''")
         ensure_column(conn, "users", "email", "TEXT", "''")
         ensure_column(conn, "athletes", "coach_user_id", "INTEGER")
+        ensure_column(conn, "training_modules", "variation", "TEXT", "''")
+        ensure_column(conn, "training_modules", "reps", "TEXT", "''")
+        ensure_column(conn, "training_modules", "weight", "TEXT", "''")
+        ensure_column(conn, "training_modules", "measurement_type", "TEXT", "''")
+        ensure_column(conn, "practice_plans", "plan_type", "TEXT", "'practice'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_status_updates_user_created ON status_updates(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_plans_created_date ON practice_plans(created_by, practice_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_calendar_events_created_date ON calendar_events(created_by, event_date)")
 
         users = conn.execute("SELECT id, username, name, email FROM users ORDER BY id").fetchall()
         for row in users:
@@ -309,6 +327,14 @@ def init_db() -> None:
                 seed = f"{seed_source}@bayoubombers.app"
             conn.execute("UPDATE users SET email=? WHERE id=?", (next_available_email(conn, seed, row["id"]), row["id"]))
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email)")
+        conn.execute(
+            "UPDATE practice_plans SET plan_type='weight_room' WHERE COALESCE(plan_type,'')='' AND id IN ("
+            "SELECT DISTINCT i.plan_id FROM practice_plan_items i "
+            "JOIN training_modules m ON m.id=i.module_id "
+            "WHERE lower(trim(m.category))='weight room'"
+            ")"
+        )
+        conn.execute("UPDATE practice_plans SET plan_type='practice' WHERE COALESCE(plan_type,'')=''")
 
         set_setting(
             conn,
@@ -404,6 +430,7 @@ def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
         "galleries",
         "site_settings",
         "coach_invites",
+        "calendar_events",
     }
     if table not in allowed_tables:
         raise ValueError("Unsupported table name")
@@ -415,7 +442,7 @@ def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, sql_type: str, default_sql: str = "") -> None:
-    if table not in {"users", "athletes"}:
+    if table not in {"users", "athletes", "training_modules", "practice_plans"}:
         raise ValueError("Unsupported table for schema alteration")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
         raise ValueError("Invalid column name")
@@ -645,6 +672,7 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None, profile_co
                     "<a href='/coach/athletes'>Athletes</a>",
                     "<a href='/coach/modules'>Modules</a>",
                     "<a href='/coach/plans'>Plans</a>",
+                    "<a href='/coach/calendar'>Calendar</a>",
                     "<a href='/coach/reports'>Reports</a>",
                     "<a href='/coach/schools'>Schools</a>",
                     "<a href='/search'>Search</a>",
@@ -656,6 +684,7 @@ def html_page(title: str, body: str, user: sqlite3.Row | None = None, profile_co
             nav_links.extend(
                 [
                     "<a href='/athlete'>Today</a>",
+                    "<a href='/athlete/calendar'>Calendar</a>",
                     "<a href='/athlete/progress'>Progress</a>",
                     "<a href='/search'>Search</a>",
                     f"<a href='/profile/{user['id']}'>Profile</a>",
@@ -707,6 +736,187 @@ def to_float(value: str, default: float = 0.0) -> float:
 
 def clamp(value: int, minimum: int, maximum: int) -> int:
     return max(min(value, maximum), minimum)
+
+
+def normalize_plan_type(value: str) -> str:
+    normalized = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return "weight_room" if normalized == "weight_room" else "practice"
+
+
+def plan_type_label(value: str) -> str:
+    return "Weight Room" if normalize_plan_type(value) == "weight_room" else "Practice"
+
+
+def category_plan_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    return "weight_room" if "weight" in normalized else "practice"
+
+
+def normalize_measurement_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"measured", "non-measured", "not_applicable"}:
+        return normalized
+    return "not_applicable"
+
+
+def measurement_type_label(value: str) -> str:
+    normalized = normalize_measurement_type(value)
+    if normalized == "measured":
+        return "Measured"
+    if normalized == "non-measured":
+        return "Non-measured"
+    return ""
+
+
+def month_start(value: str = "") -> date:
+    raw = (value or "").strip()
+    if raw:
+        try:
+            parsed = datetime.strptime(raw, "%Y-%m").date()
+            return date(parsed.year, parsed.month, 1)
+        except ValueError:
+            pass
+    today = date.today()
+    return date(today.year, today.month, 1)
+
+
+def shift_month(value: date, delta: int) -> date:
+    total = (value.year * 12) + value.month - 1 + delta
+    year = total // 12
+    month = (total % 12) + 1
+    return date(year, month, 1)
+
+
+def month_key(value: date) -> str:
+    return value.strftime("%Y-%m")
+
+
+def module_detail_bits(module: sqlite3.Row, reps_override: str = "", notes_override: str = "") -> list[str]:
+    bits: list[str] = []
+    variation = (module["variation"] or "").strip()
+    reps = (reps_override or module["reps"] or "").strip()
+    weight = (module["weight"] or "").strip()
+    measurement = measurement_type_label(module["measurement_type"] or "")
+    notes = (notes_override or module["description"] or "").strip()
+    category = (module["category"] or "").strip()
+    if category:
+        bits.append(category)
+    if variation:
+        bits.append(f"Variation: {variation}")
+    if reps:
+        bits.append(f"Reps: {reps}")
+    if weight:
+        bits.append(f"Weight: {weight}")
+    if measurement:
+        bits.append(measurement)
+    if notes:
+        bits.append(notes)
+    return bits
+
+
+def render_module_summary(module: sqlite3.Row, reps_override: str = "", notes_override: str = "") -> str:
+    bits = module_detail_bits(module, reps_override, notes_override)
+    summary = "".join(f"<span class='tag'>{esc(bit)}</span>" for bit in bits)
+    return (
+        "<div class='module-summary'>"
+        f"<strong>{esc(module['name'])}</strong>"
+        f"<div class='tag-wrap'>{summary or '<span class=\"muted\">No extra module details.</span>'}</div>"
+        "</div>"
+    )
+
+
+def render_calendar(entries: list[dict[str, str]], month_value: str, base_path: str, extra_query: str = "") -> str:
+    current_month = month_start(month_value)
+    prev_month = month_key(shift_month(current_month, -1))
+    next_month = month_key(shift_month(current_month, 1))
+    month_label = current_month.strftime("%B %Y")
+    prefix = f"{extra_query}&" if extra_query else ""
+    prev_href = f"{base_path}?{prefix}month={prev_month}"
+    next_href = f"{base_path}?{prefix}month={next_month}"
+
+    grouped: dict[str, dict[str, object]] = {}
+    for entry in entries:
+        day = entry["date"]
+        bucket = grouped.setdefault(day, {"types": set(), "cards": []})
+        cast_types = bucket["types"]
+        cast_cards = bucket["cards"]
+        if isinstance(cast_types, set):
+            cast_types.add(entry["type"])
+        if isinstance(cast_cards, list):
+            cast_cards.append(
+                "<article class='calendar-entry-card'>"
+                f"<div class='calendar-entry-type {esc(entry['type']).replace('_', '-')}'>{esc(entry['label'])}</div>"
+                f"<h4>{esc(entry['title'])}</h4>"
+                f"{entry['body']}"
+                "</article>"
+            )
+
+    first_weekday, days_in_month = calendar.monthrange(current_month.year, current_month.month)
+    cells = ["<div class='calendar-day empty'></div>" for _ in range(first_weekday)]
+    for day_number in range(1, days_in_month + 1):
+        day_value = date(current_month.year, current_month.month, day_number).isoformat()
+        details = grouped.get(day_value, {"types": set(), "cards": []})
+        dot_types = sorted(details["types"]) if isinstance(details["types"], set) else []
+        dot_html = "".join(
+            f"<span class='calendar-dot {esc(dot_type).replace('_', '-')}' aria-hidden='true'></span>"
+            for dot_type in dot_types
+        )
+        has_events = bool(dot_types)
+        cells.append(
+            f"<button type='button' class='calendar-day{' has-events' if has_events else ''}' data-calendar-date='{day_value}'>"
+            f"<span class='calendar-day-number'>{day_number}</span>"
+            f"<span class='calendar-day-dots'>{dot_html}</span>"
+            "</button>"
+        )
+
+    detail_panels = [
+        "<div class='calendar-detail-panel active' data-calendar-panel='default'>"
+        "<p class='muted'>Select a day with dots to inspect scheduled details.</p>"
+        "</div>"
+    ]
+    for day_value in sorted(grouped):
+        if not day_value.startswith(month_key(current_month)):
+            continue
+        day_label = datetime.strptime(day_value, "%Y-%m-%d").strftime("%b %d, %Y")
+        cards = grouped[day_value]["cards"]
+        card_html = "".join(cards) if isinstance(cards, list) else ""
+        detail_panels.append(
+            f"<div class='calendar-detail-panel' data-calendar-panel='{day_value}'>"
+            f"<div class='section-head'><h3>{esc(day_label)}</h3></div>"
+            f"{card_html}"
+            "</div>"
+        )
+
+    return f"""
+    <section class='card calendar-widget'>
+      <div class='section-head'>
+        <div>
+          <h3>Schedule Calendar</h3>
+          <p class='muted'>Green dots mark practice, red dots mark weight room, with break and meet days also visible.</p>
+        </div>
+        <div class='inline'>
+          <a class='btn secondary btn-small' href='{prev_href}'>Prev</a>
+          <strong>{esc(month_label)}</strong>
+          <a class='btn secondary btn-small' href='{next_href}'>Next</a>
+        </div>
+      </div>
+      <div class='calendar-legend'>
+        <span><span class='calendar-dot practice'></span>Practice</span>
+        <span><span class='calendar-dot weight-room'></span>Weight Room</span>
+        <span><span class='calendar-dot meet-day'></span>Meet Day</span>
+        <span><span class='calendar-dot break'></span>Break</span>
+      </div>
+      <div class='calendar-shell'>
+        <div>
+          <div class='calendar-weekdays'>
+            <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+          </div>
+          <div class='calendar-grid'>{"".join(cells)}</div>
+        </div>
+        <div class='calendar-detail-area'>{"".join(detail_panels)}</div>
+      </div>
+    </section>
+    """
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -814,10 +1024,29 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.add_module(user)
 
         if path == "/coach/plans" and method == "GET":
-            return self.respond_html(self.coach_plans(user, query.get("msg", [""])[0]))
+            return self.respond_html(
+                self.coach_plans(
+                    user,
+                    query.get("msg", [""])[0],
+                    query.get("tab", ["practice"])[0],
+                    query.get("month", [""])[0],
+                )
+            )
 
         if path == "/coach/plans" and method == "POST":
             return self.add_plan(user)
+
+        if path == "/coach/calendar" and method == "GET":
+            return self.respond_html(self.coach_calendar(user, query.get("msg", [""])[0], query.get("month", [""])[0]))
+
+        if path == "/coach/calendar/events" and method == "POST":
+            return self.add_calendar_event(user)
+
+        if path == "/coach/calendar/events/update" and method == "POST":
+            return self.update_calendar_event(user)
+
+        if path == "/coach/calendar/events/delete" and method == "POST":
+            return self.delete_calendar_event(user)
 
         if path == "/coach/athletes/search" and method == "GET":
             return self.respond_html(self.coach_athlete_search(user, query.get("q", [""])[0]))
@@ -836,6 +1065,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if path == "/athlete/progress":
             return self.respond_html(self.athlete_progress(user))
+
+        if path == "/athlete/calendar":
+            return self.respond_html(self.athlete_calendar(user, query.get("month", [""])[0]))
 
         if path == "/athlete/invite/respond" and method == "POST":
             return self.respond_invite(user)
@@ -1897,7 +2129,17 @@ class AppHandler(BaseHTTPRequestHandler):
             modules = conn.execute("SELECT * FROM training_modules ORDER BY id DESC").fetchall()
 
         rows = "".join(
-            f"<tr><td>{m['id']}</td><td>{esc(m['name'])}</td><td>{esc(m['category'])}</td><td>{esc(m['description'])}</td></tr>"
+            "<tr>"
+            f"<td>{m['id']}</td>"
+            f"<td>{esc(m['name'])}</td>"
+            f"<td>{plan_type_label(category_plan_type(m['category']))}</td>"
+            f"<td>{esc(m['category'])}</td>"
+            f"<td>{esc(m['variation'] or '—')}</td>"
+            f"<td>{esc(m['reps'] or '—')}</td>"
+            f"<td>{esc(m['weight'] or '—')}</td>"
+            f"<td>{esc(measurement_type_label(m['measurement_type']) or '—')}</td>"
+            f"<td>{esc(m['description'] or '—')}</td>"
+            "</tr>"
             for m in modules
         )
         body = f"""
@@ -1906,14 +2148,25 @@ class AppHandler(BaseHTTPRequestHandler):
             <h3>Create Training Module</h3>
             <form method='post' action='/coach/modules'>
               <label>Module Name<input name='name' required></label>
-              <label>Category<select name='category'><option>Technique</option><option>Throws</option><option>Weight Room</option></select></label>
-              <label>Description<textarea name='description' required></textarea></label>
+              <div class='row'>
+                <label>Section<select name='plan_type'><option value='practice'>Practice</option><option value='weight_room'>Weight Room</option></select></label>
+                <label>Category<input name='category' value='Technique' placeholder='Technique, Throws, Weight Room'></label>
+              </div>
+              <div class='row'>
+                <label>Variation<input name='variation' placeholder='Standing throw, tempo, close grip'></label>
+                <label>Reps<input name='reps' placeholder='3x5 or 6 throws'></label>
+              </div>
+              <div class='row'>
+                <label>Weight (if applicable)<input name='weight' placeholder='135 lbs or bodyweight'></label>
+                <label>Measured<select name='measurement_type'><option value='not_applicable'>Not applicable</option><option value='measured'>Measured</option><option value='non-measured'>Non-measured</option></select></label>
+              </div>
+              <label>Coach Notes<textarea name='description' placeholder='Optional cues or context'></textarea></label>
               <button type='submit'>Save Module</button>
             </form>
           </div>
           <div class='card'>
             <h3>Module Library</h3>
-            <table><tr><th>ID</th><th>Name</th><th>Category</th><th>Description</th></tr>{rows}</table>
+            <table><tr><th>ID</th><th>Name</th><th>Section</th><th>Category</th><th>Variation</th><th>Reps</th><th>Weight</th><th>Measured</th><th>Notes</th></tr>{rows}</table>
           </div>
         </div>
         """
@@ -1921,18 +2174,152 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def add_module(self, user: sqlite3.Row) -> None:
         form = self.read_form()
+        plan_type = normalize_plan_type(form.get("plan_type", "practice"))
+        category = form.get("category", "").strip()
+        if not category:
+            category = "Weight Room" if plan_type == "weight_room" else "Technique"
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO training_modules (name,category,description) VALUES (?,?,?)",
-                (form.get("name", "Module"), form.get("category", "Technique"), form.get("description", "")),
+                """
+                INSERT INTO training_modules (name,category,description,variation,reps,weight,measurement_type)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    form.get("name", "Module").strip() or "Module",
+                    category,
+                    form.get("description", "").strip(),
+                    form.get("variation", "").strip(),
+                    form.get("reps", "").strip(),
+                    form.get("weight", "").strip(),
+                    normalize_measurement_type(form.get("measurement_type", "not_applicable")),
+                ),
             )
         self.redirect("/coach/modules")
 
-    def coach_plans(self, user: sqlite3.Row, message: str = "") -> str:
+    def coach_schedule_entries(self, user: sqlite3.Row) -> list[dict[str, str]]:
         with db_conn() as conn:
-            modules = conn.execute("SELECT id,name,category FROM training_modules ORDER BY name").fetchall()
             plans = conn.execute(
-                "SELECT id,title,practice_date,notes,created_by FROM practice_plans WHERE created_by=? ORDER BY practice_date DESC, id DESC",
+                """
+                SELECT p.id, p.title, p.practice_date, p.notes, p.plan_type, COUNT(ass.id) AS assigned_count
+                FROM practice_plans p
+                LEFT JOIN assignments ass ON ass.plan_id=p.id
+                WHERE p.created_by=?
+                GROUP BY p.id
+                ORDER BY p.practice_date, p.id
+                """,
+                (user["id"],),
+            ).fetchall()
+            events = conn.execute(
+                "SELECT id, title, event_date, event_type, notes FROM calendar_events WHERE created_by=? ORDER BY event_date, id",
+                (user["id"],),
+            ).fetchall()
+
+            entries: list[dict[str, str]] = []
+            for plan in plans:
+                items = conn.execute(
+                    """
+                    SELECT m.name, m.category, m.description, m.variation, m.reps AS module_reps, m.weight, m.measurement_type, i.reps, i.notes
+                    FROM practice_plan_items i
+                    JOIN training_modules m ON m.id=i.module_id
+                    WHERE i.plan_id=?
+                    ORDER BY i.id
+                    """,
+                    (plan["id"],),
+                ).fetchall()
+                body = (
+                    f"<p class='muted'>{plan['assigned_count']} athlete(s) assigned.</p>"
+                    + "".join(render_module_summary(item, item["reps"] or "", item["notes"] or "") for item in items)
+                )
+                entries.append(
+                    {
+                        "date": plan["practice_date"],
+                        "type": normalize_plan_type(plan["plan_type"]),
+                        "label": plan_type_label(plan["plan_type"]),
+                        "title": plan["title"],
+                        "body": body,
+                    }
+                )
+            for event in events:
+                entries.append(
+                    {
+                        "date": event["event_date"],
+                        "type": (event["event_type"] or "break").replace("_", "-"),
+                        "label": "Meet Day" if event["event_type"] == "meet_day" else "Break",
+                        "title": event["title"],
+                        "body": format_text_block(event["notes"], "No notes."),
+                    }
+                )
+        return entries
+
+    def coach_event_forms(self, user: sqlite3.Row, active_tab: str, month_value: str, return_to: str) -> str:
+        with db_conn() as conn:
+            events = conn.execute(
+                "SELECT id, title, event_date, event_type, notes FROM calendar_events WHERE created_by=? ORDER BY event_date, id",
+                (user["id"],),
+            ).fetchall()
+        event_rows = "".join(
+            f"""
+            <form method='post' action='/coach/calendar/events/update' class='school-edit-form'>
+              <input type='hidden' name='event_id' value='{event['id']}'>
+              <input type='hidden' name='return_to' value='{return_to}'>
+              <input type='hidden' name='tab' value='{active_tab}'>
+              <input type='hidden' name='month' value='{esc(month_value)}'>
+              <div class='row'>
+                <label>Title<input name='title' value='{esc(event['title'])}' required></label>
+                <label>Date<input type='date' name='event_date' value='{esc(event['event_date'])}' required></label>
+              </div>
+              <div class='row'>
+                <label>Type<select name='event_type'>
+                  <option value='break' {'selected' if event['event_type'] == 'break' else ''}>Break</option>
+                  <option value='meet_day' {'selected' if event['event_type'] == 'meet_day' else ''}>Meet Day</option>
+                </select></label>
+                <label>Notes<textarea name='notes'>{esc(event['notes'] or '')}</textarea></label>
+              </div>
+              <div class='inline'>
+                <button type='submit'>Update Event</button>
+                <button type='submit' formaction='/coach/calendar/events/delete' class='secondary'>Delete</button>
+              </div>
+            </form>
+            """
+            for event in events
+        ) or "<p class='muted'>No break or meet day events have been added yet.</p>"
+        return f"""
+        <div class='card'>
+          <h3>Add Break or Meet Day</h3>
+          <form method='post' action='/coach/calendar/events'>
+            <input type='hidden' name='return_to' value='{return_to}'>
+            <input type='hidden' name='tab' value='{active_tab}'>
+            <input type='hidden' name='month' value='{esc(month_value)}'>
+            <div class='row'>
+              <label>Title<input name='title' placeholder='Spring break, Conference meet' required></label>
+              <label>Date<input type='date' name='event_date' value='{date.today().isoformat()}' required></label>
+            </div>
+            <div class='row'>
+              <label>Type<select name='event_type'><option value='break'>Break</option><option value='meet_day'>Meet Day</option></select></label>
+              <label>Notes<textarea name='notes' placeholder='Optional details'></textarea></label>
+            </div>
+            <button type='submit'>Save Event</button>
+          </form>
+        </div>
+        <div class='card'>
+          <h3>Edit Breaks and Meet Days</h3>
+          <div class='stack'>{event_rows}</div>
+        </div>
+        """
+
+    def coach_plans(self, user: sqlite3.Row, message: str = "", active_tab: str = "practice", month_value: str = "") -> str:
+        active_tab = normalize_plan_type(active_tab)
+        month_value = month_value or month_key(month_start())
+        with db_conn() as conn:
+            modules = conn.execute(
+                """
+                SELECT id, name, category, description, variation, reps, weight, measurement_type
+                FROM training_modules
+                ORDER BY name
+                """
+            ).fetchall()
+            plans = conn.execute(
+                "SELECT id,title,practice_date,notes,created_by,plan_type FROM practice_plans WHERE created_by=? ORDER BY practice_date DESC, id DESC",
                 (user["id"],),
             ).fetchall()
             athletes = conn.execute(
@@ -1944,14 +2331,15 @@ class AppHandler(BaseHTTPRequestHandler):
             for p in plans:
                 items = conn.execute(
                     """
-                    SELECT m.name, m.category, i.reps, i.notes
+                    SELECT m.name, m.category, m.description, m.variation, m.reps AS module_reps, m.weight, m.measurement_type, i.reps, i.notes
                     FROM practice_plan_items i JOIN training_modules m ON m.id=i.module_id
                     WHERE i.plan_id=?
+                    ORDER BY i.id
                     """,
                     (p["id"],),
                 ).fetchall()
                 item_list = "".join(
-                    f"<li>{esc(it['name'])} ({esc(it['category'])}) - {esc(it['reps'] or '')} {esc(it['notes'] or '')}</li>"
+                    f"<li>{render_module_summary(it, it['reps'] or '', it['notes'] or '')}</li>"
                     for it in items
                 ) or "<li class='muted'>No items.</li>"
                 assigned_count = conn.execute("SELECT COUNT(*) AS c FROM assignments WHERE plan_id=?", (p["id"],)).fetchone()["c"]
@@ -1971,51 +2359,73 @@ class AppHandler(BaseHTTPRequestHandler):
                     f"<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-athlete-choice' value='{a['id']}'><span>{esc(a['athlete_name'])}</span></label>"
                     for a in athletes
                 ) or "<p class='muted'>Add athletes to your roster before assigning plans.</p>"
-                plan_cards.append(
-                    f"<div class='card plan-card'><h4>{esc(p['title'])}</h4><div class='muted'>{esc(p['practice_date'])} • {assigned_count} assigned</div>"
-                    f"<p>{esc(p['notes'] or 'No plan-level notes.')}</p>"
-                    f"<h5>Modules</h5><ul>{item_list}</ul>"
-                    f"<h5>Assigned Athletes</h5><div class='tag-wrap'>{assigned_tags}</div>"
-                    f"<form method='post' action='/coach/assign'><input type='hidden' name='plan_id' value='{p['id']}'><input type='hidden' name='athlete_ids' value=''>"
-                    "<div class='plan-select-tools'>"
-                    "<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-select-all'><span>Select all athletes</span></label>"
-                    "</div>"
-                    f"<div class='plan-athlete-list'>{athlete_checks}</div>"
-                    "<button type='submit'>Assign to Selected Athletes</button></form></div>"
-                )
+                if normalize_plan_type(p["plan_type"]) == active_tab:
+                    plan_cards.append(
+                        f"<div class='card plan-card'><h4>{esc(p['title'])}</h4><div class='muted'>{plan_type_label(p['plan_type'])} • {esc(p['practice_date'])} • {assigned_count} assigned</div>"
+                        f"<p>{esc(p['notes'] or 'No plan-level notes.')}</p>"
+                        f"<h5>Modules</h5><ul>{item_list}</ul>"
+                        f"<h5>Assigned Athletes</h5><div class='tag-wrap'>{assigned_tags}</div>"
+                        f"<form method='post' action='/coach/assign'><input type='hidden' name='plan_id' value='{p['id']}'><input type='hidden' name='athlete_ids' value=''><input type='hidden' name='tab' value='{normalize_plan_type(p['plan_type'])}'><input type='hidden' name='month' value='{esc(month_value)}'>"
+                        "<div class='plan-select-tools'>"
+                        "<label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-select-all'><span>Select all athletes</span></label>"
+                        "</div>"
+                        f"<div class='plan-athlete-list'>{athlete_checks}</div>"
+                        "<button type='submit'>Assign to Selected Athletes</button></form></div>"
+                    )
 
+        relevant_modules = [m for m in modules if category_plan_type(m["category"]) == active_tab]
         module_options = "".join(
-            f"<option value='{m['id']}'>{esc(m['name'])} ({esc(m['category'])})</option>" for m in modules
-        )
+            f"<label class='checkbox-row module-choice'><input type='checkbox' class='plan-module-choice' value='{m['id']}'><div class='module-choice-copy'>{render_module_summary(m)}</div></label>"
+            for m in relevant_modules
+        ) or "<p class='muted'>No modules available in this section yet.</p>"
         athlete_help = ", ".join(esc(a["athlete_name"]) for a in athletes) or "No athletes found"
-        plans_html = "".join(plan_cards) if plan_cards else "<div class='card'>No plans yet.</div>"
+        plans_html = "".join(plan_cards) or "<div class='card'>No plans yet in this section.</div>"
         message_html = f"<div class='notice card'>{esc(message)}</div>" if message else ""
+        tab_links = (
+            f"<a class='plan-tab{' active' if active_tab == 'practice' else ''}' href='/coach/plans?tab=practice&month={esc(month_value)}'>Practice</a>"
+            f"<a class='plan-tab{' active' if active_tab == 'weight_room' else ''}' href='/coach/plans?tab=weight_room&month={esc(month_value)}'>Weight Room</a>"
+        )
+        calendar_html = render_calendar(self.coach_schedule_entries(user), month_value, "/coach/plans", f"tab={active_tab}")
+        event_manager = self.coach_event_forms(user, active_tab, month_value, "plans")
 
         body = f"""
         {message_html}
-        <div class='grid plan-layout'>
-          <div class='card school-accent'>
-            <h3>Create Practice Plan</h3>
-            <p class='muted'>Build a plan first, then assign it to one or more athletes from a selectable list.</p>
-            <form method='post' action='/coach/plans'>
-              <label>Title<input name='title' required></label>
-              <div class='row'>
-                <label>Date<input type='date' name='practice_date' value='{date.today().isoformat()}' required></label>
-                <label>Module<select name='module_id'>{module_options}</select></label>
-              </div>
-              <div class='row'>
-                <label>Reps / Volume<input name='reps' placeholder='3x5 or 6 throws'></label>
-                <label>Notes<input name='notes' placeholder='Quality over volume'></label>
-              </div>
-              <label>Plan Notes<textarea name='plan_notes'></textarea></label>
-              <button type='submit'>Save Practice Plan</button>
-            </form>
-            <p class='muted'>Current roster: {athlete_help}</p>
+        <div class='plan-tabs'>{tab_links}</div>
+        <div class='grid plan-layout plan-layout-wide'>
+          <div class='stack'>
+            <div class='card school-accent'>
+              <h3>Create {plan_type_label(active_tab)} Plan</h3>
+              <p class='muted'>Build a plan first, then assign it to one or more athletes from a selectable list.</p>
+              <form method='post' action='/coach/plans' class='module-picker-form'>
+                <input type='hidden' name='plan_type' value='{active_tab}'>
+                <input type='hidden' name='module_ids' value=''>
+                <input type='hidden' name='tab' value='{active_tab}'>
+                <input type='hidden' name='month' value='{esc(month_value)}'>
+                <label>Title<input name='title' required></label>
+                <div class='row'>
+                  <label>Date<input type='date' name='practice_date' value='{date.today().isoformat()}' required></label>
+                  <label>Plan Notes<input name='plan_notes' placeholder='What should athletes know for this session?'></label>
+                </div>
+                <div class='plan-select-tools'>
+                  <label class='checkbox-row plan-checkbox'><input type='checkbox' class='plan-select-all-modules'><span>Select all {plan_type_label(active_tab).lower()} modules</span></label>
+                </div>
+                <div class='plan-module-list'>{module_options}</div>
+                <button type='submit'>Save {plan_type_label(active_tab)} Plan</button>
+              </form>
+              <p class='muted'>Current roster: {athlete_help}</p>
+            </div>
+            {event_manager}
           </div>
           <div class='stack'>
+            {calendar_html}
             <div class='card'>
-              <h3>Practice Plans</h3>
-              <p class='muted'>Review plan details and assign quickly to one, many, or all athletes.</p>
+              <div class='section-head'>
+                <div>
+                  <h3>{plan_type_label(active_tab)} Plans</h3>
+                  <p class='muted'>Review plan details and assign quickly to one, many, or all athletes.</p>
+                </div>
+                <a class='btn secondary btn-small' href='/coach/calendar?month={esc(month_value)}'>Open full calendar</a>
+              </div>
             </div>
             {plans_html}
           </div>
@@ -2026,30 +2436,41 @@ class AppHandler(BaseHTTPRequestHandler):
     def add_plan(self, user: sqlite3.Row) -> None:
         form = self.read_form()
         practice_date = form.get("practice_date", date.today().isoformat())
+        plan_type = normalize_plan_type(form.get("plan_type", form.get("tab", "practice")))
+        month_value = form.get("month", month_key(month_start()))
+        selected_module_ids = [to_int(x, 0) for x in form.get("module_ids", "").split(",") if x.strip()]
+        if not selected_module_ids:
+            return self.redirect(f"/coach/plans?tab={plan_type}&month={month_value}&msg=Select+at+least+one+module.")
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO practice_plans (title,practice_date,notes,created_by) VALUES (?,?,?,?)",
-                (form.get("title", "Practice"), practice_date, form.get("plan_notes", ""), user["id"]),
+                "INSERT INTO practice_plans (title,practice_date,notes,created_by,plan_type) VALUES (?,?,?,?,?)",
+                (form.get("title", "Practice"), practice_date, form.get("plan_notes", ""), user["id"], plan_type),
             )
             plan_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            conn.execute(
-                "INSERT INTO practice_plan_items (plan_id,module_id,reps,notes) VALUES (?,?,?,?)",
-                (plan_id, to_int(form.get("module_id", "1"), 1), form.get("reps", ""), form.get("notes", "")),
-            )
-        self.redirect("/coach/plans")
+            for module_id in selected_module_ids:
+                module = conn.execute("SELECT id FROM training_modules WHERE id=?", (module_id,)).fetchone()
+                if module is None:
+                    continue
+                conn.execute(
+                    "INSERT INTO practice_plan_items (plan_id,module_id,reps,notes) VALUES (?,?,?,?)",
+                    (plan_id, module_id, "", ""),
+                )
+        self.redirect(f"/coach/plans?tab={plan_type}&month={month_value}&msg=Plan+saved.")
 
     def assign_plan(self, user: sqlite3.Row) -> None:
         form = self.read_form()
         plan_id = to_int(form.get("plan_id", "0"), 0)
         athlete_ids_raw = form.get("athlete_ids", "")
         athlete_ids = [to_int(x, -1) for x in athlete_ids_raw.split(",") if x.strip()]
+        tab = normalize_plan_type(form.get("tab", "practice"))
+        month_value = form.get("month", month_key(month_start()))
         if not athlete_ids or plan_id < 1:
-            self.redirect("/coach/plans?msg=Please+select+at+least+one+athlete+to+assign.")
+            self.redirect(f"/coach/plans?tab={tab}&month={month_value}&msg=Please+select+at+least+one+athlete+to+assign.")
             return
         with db_conn() as conn:
             plan = conn.execute("SELECT id FROM practice_plans WHERE id=? AND created_by=?", (plan_id, user["id"])).fetchone()
             if plan is None:
-                return self.redirect("/coach/plans?msg=That+practice+plan+could+not+be+assigned.")
+                return self.redirect(f"/coach/plans?tab={tab}&month={month_value}&msg=That+plan+could+not+be+assigned.")
             for athlete_id in athlete_ids:
                 if athlete_id < 1:
                     continue
@@ -2065,7 +2486,86 @@ class AppHandler(BaseHTTPRequestHandler):
                         "INSERT INTO assignments (plan_id,athlete_id,status,assigned_on) VALUES (?,?,?,?)",
                         (plan_id, athlete_id, "assigned", date.today().isoformat()),
                     )
-        self.redirect("/coach/plans?msg=Plan+assigned+to+selected+athletes.")
+        self.redirect(f"/coach/plans?tab={tab}&month={month_value}&msg=Plan+assigned+to+selected+athletes.")
+
+    def coach_calendar(self, user: sqlite3.Row, message: str = "", month_value: str = "") -> str:
+        month_value = month_value or month_key(month_start())
+        calendar_html = render_calendar(self.coach_schedule_entries(user), month_value, "/coach/calendar")
+        event_manager = self.coach_event_forms(user, "practice", month_value, "calendar")
+        message_html = f"<div class='notice card'>{esc(message)}</div>" if message else ""
+        body = f"""
+        {message_html}
+        <div class='stack'>
+          {calendar_html}
+          {event_manager}
+        </div>
+        """
+        return html_page("Coach Calendar", body, user)
+
+    def add_calendar_event(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        month_value = form.get("month", month_key(month_start()))
+        tab = normalize_plan_type(form.get("tab", "practice"))
+        return_to = form.get("return_to", "calendar")
+        event_type = form.get("event_type", "break")
+        if event_type not in {"break", "meet_day"}:
+            event_type = "break"
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO calendar_events (title,event_date,event_type,notes,created_by) VALUES (?,?,?,?,?)",
+                (
+                    form.get("title", "Event").strip() or "Event",
+                    form.get("event_date", date.today().isoformat()),
+                    event_type,
+                    form.get("notes", "").strip(),
+                    user["id"],
+                ),
+            )
+        destination = "/coach/calendar" if return_to == "calendar" else f"/coach/plans?tab={tab}&month={month_value}"
+        separator = "&" if "?" in destination else "?"
+        self.redirect(f"{destination}{separator}msg=Calendar+event+saved.")
+
+    def update_calendar_event(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        month_value = form.get("month", month_key(month_start()))
+        tab = normalize_plan_type(form.get("tab", "practice"))
+        return_to = form.get("return_to", "calendar")
+        event_type = form.get("event_type", "break")
+        if event_type not in {"break", "meet_day"}:
+            event_type = "break"
+        with db_conn() as conn:
+            conn.execute(
+                """
+                UPDATE calendar_events
+                SET title=?, event_date=?, event_type=?, notes=?
+                WHERE id=? AND created_by=?
+                """,
+                (
+                    form.get("title", "Event").strip() or "Event",
+                    form.get("event_date", date.today().isoformat()),
+                    event_type,
+                    form.get("notes", "").strip(),
+                    to_int(form.get("event_id", "0"), 0),
+                    user["id"],
+                ),
+            )
+        destination = "/coach/calendar" if return_to == "calendar" else f"/coach/plans?tab={tab}&month={month_value}"
+        separator = "&" if "?" in destination else "?"
+        self.redirect(f"{destination}{separator}msg=Calendar+event+updated.")
+
+    def delete_calendar_event(self, user: sqlite3.Row) -> None:
+        form = self.read_form()
+        month_value = form.get("month", month_key(month_start()))
+        tab = normalize_plan_type(form.get("tab", "practice"))
+        return_to = form.get("return_to", "calendar")
+        with db_conn() as conn:
+            conn.execute(
+                "DELETE FROM calendar_events WHERE id=? AND created_by=?",
+                (to_int(form.get("event_id", "0"), 0), user["id"]),
+            )
+        destination = "/coach/calendar" if return_to == "calendar" else f"/coach/plans?tab={tab}&month={month_value}"
+        separator = "&" if "?" in destination else "?"
+        self.redirect(f"{destination}{separator}msg=Calendar+event+deleted.")
 
     def coach_reports(self, user: sqlite3.Row) -> str:
         since = (date.today() - timedelta(days=7)).isoformat()
@@ -2125,6 +2625,67 @@ class AppHandler(BaseHTTPRequestHandler):
         with db_conn() as conn:
             return conn.execute("SELECT * FROM athletes WHERE user_id=?", (user["id"],)).fetchone()
 
+    def athlete_schedule_entries(self, athlete: sqlite3.Row) -> list[dict[str, str]]:
+        with db_conn() as conn:
+            assignments = conn.execute(
+                """
+                SELECT ass.id AS assignment_id, ass.status, p.title, p.practice_date, p.notes, p.plan_type
+                FROM assignments ass
+                JOIN practice_plans p ON p.id=ass.plan_id
+                WHERE ass.athlete_id=?
+                ORDER BY p.practice_date, p.id
+                """,
+                (athlete["id"],),
+            ).fetchall()
+            coach_events = []
+            if athlete["coach_user_id"]:
+                coach_events = conn.execute(
+                    """
+                    SELECT title, event_date, event_type, notes
+                    FROM calendar_events
+                    WHERE created_by=?
+                    ORDER BY event_date, id
+                    """,
+                    (athlete["coach_user_id"],),
+                ).fetchall()
+
+            entries: list[dict[str, str]] = []
+            for assignment in assignments:
+                items = conn.execute(
+                    """
+                    SELECT m.name, m.category, m.description, m.variation, m.reps AS module_reps, m.weight, m.measurement_type, i.reps, i.notes
+                    FROM practice_plan_items i
+                    JOIN training_modules m ON m.id=i.module_id
+                    WHERE i.plan_id=(SELECT plan_id FROM assignments WHERE id=?)
+                    ORDER BY i.id
+                    """,
+                    (assignment["assignment_id"],),
+                ).fetchall()
+                body = (
+                    f"<p class='muted'>Status: {esc(assignment['status'])}</p>"
+                    + "".join(render_module_summary(item, item["reps"] or "", item["notes"] or "") for item in items)
+                )
+                entries.append(
+                    {
+                        "date": assignment["practice_date"],
+                        "type": normalize_plan_type(assignment["plan_type"]),
+                        "label": plan_type_label(assignment["plan_type"]),
+                        "title": assignment["title"],
+                        "body": body,
+                    }
+                )
+            for event in coach_events:
+                entries.append(
+                    {
+                        "date": event["event_date"],
+                        "type": (event["event_type"] or "break").replace("_", "-"),
+                        "label": "Meet Day" if event["event_type"] == "meet_day" else "Break",
+                        "title": event["title"],
+                        "body": format_text_block(event["notes"], "No notes."),
+                    }
+                )
+        return entries
+
     def athlete_dashboard(self, user: sqlite3.Row) -> str:
         athlete = self.athlete_context(user)
         if athlete is None:
@@ -2134,11 +2695,11 @@ class AppHandler(BaseHTTPRequestHandler):
         with db_conn() as conn:
             assignments = conn.execute(
                 """
-                SELECT ass.id AS assignment_id, ass.status, p.title, p.practice_date, p.notes
+                SELECT ass.id AS assignment_id, ass.status, p.title, p.practice_date, p.notes, p.plan_type
                 FROM assignments ass
                 JOIN practice_plans p ON p.id=ass.plan_id
-                WHERE ass.athlete_id=? AND p.practice_date<=?
-                ORDER BY p.practice_date DESC
+                WHERE ass.athlete_id=? AND p.practice_date=?
+                ORDER BY p.practice_date DESC, p.id DESC
                 """,
                 (athlete["id"], today),
             ).fetchall()
@@ -2146,11 +2707,12 @@ class AppHandler(BaseHTTPRequestHandler):
             for ass in assignments:
                 items_by_assignment[ass["assignment_id"]] = conn.execute(
                     """
-                    SELECT m.name, m.category, i.reps, i.notes
+                    SELECT m.name, m.category, m.description, m.variation, m.reps AS module_reps, m.weight, m.measurement_type, i.reps, i.notes
                     FROM practice_plan_items i
                     JOIN assignments a ON a.plan_id=i.plan_id
                     JOIN training_modules m ON m.id=i.module_id
                     WHERE a.id=?
+                    ORDER BY i.id
                     """,
                     (ass["assignment_id"],),
                 ).fetchall()
@@ -2182,35 +2744,58 @@ class AppHandler(BaseHTTPRequestHandler):
             for inv in pending_invites
         )
 
-        assignment_cards = []
+        practice_cards = []
+        weight_room_cards = []
         for ass in assignments:
             items = items_by_assignment.get(ass["assignment_id"], [])
-            item_list = "".join(
-                f"<li>{esc(i['name'])} ({esc(i['category'])}) — {esc(i['reps'] or '')} {esc(i['notes'] or '')}</li>"
-                for i in items
-            ) or "<li class='muted'>No item details</li>"
+            item_list = "".join(f"<li>{render_module_summary(i, i['reps'] or '', i['notes'] or '')}</li>" for i in items) or "<li class='muted'>No item details</li>"
             complete_button = ""
             if ass["status"] != "completed":
                 complete_button = (
                     f"<form method='post' action='/athlete/assignment/{ass['assignment_id']}/complete'>"
                     "<button type='submit'>Mark Completed</button></form>"
                 )
-            assignment_cards.append(
+            card_html = (
                 f"<div class='card'><h4>{esc(ass['title'])}</h4><div class='muted'>{esc(ass['practice_date'])} — {esc(ass['status'])}</div>"
                 f"<ul>{item_list}</ul>{complete_button}</div>"
             )
+            if normalize_plan_type(ass["plan_type"]) == "weight_room":
+                weight_room_cards.append(card_html)
+            else:
+                practice_cards.append(card_html)
 
-        assignments_html = "".join(assignment_cards) if assignment_cards else "<div class='card'>No assignments yet.</div>"
+        practice_html = "".join(practice_cards) if practice_cards else "<div class='card'>No practice modules scheduled for today.</div>"
+        weight_room_html = "".join(weight_room_cards) if weight_room_cards else "<div class='card'>No weight room modules scheduled for today.</div>"
         body = f"""
         {invite_banners}
         <div class='card'>
           <h3>Welcome back, {esc(user['name'])}</h3>
           <p class='muted'>Events: {esc(athlete['events'])} | Group: {esc(athlete['group_name'] or 'N/A')}</p>
         </div>
+        <div class='stack' style='margin-top:12px'>
+          <div>
+            <div class='section-head'>
+              <div>
+                <h3 style='margin:0'>Today's Practice</h3>
+                <p class='muted'>Practice modules are shown first so athletes can see the throwing session immediately.</p>
+              </div>
+              <a class='btn secondary btn-small' href='/athlete/calendar'>Open calendar</a>
+            </div>
+            {practice_html}
+          </div>
+          <div>
+            <div class='section-head'>
+              <div>
+                <h3 style='margin:0'>Today's Weight Room</h3>
+                <p class='muted'>Weight room work is separated from throws so the two sessions stay easy to scan.</p>
+              </div>
+            </div>
+            {weight_room_html}
+          </div>
+        </div>
         <div class='grid' style='margin-top:12px'>
           <div>
-            <h3 style='margin:0 0 10px'>Assignments</h3>
-            {assignments_html}
+            {render_calendar(self.athlete_schedule_entries(athlete), month_key(month_start()), '/athlete/calendar')}
           </div>
           <div>
             <div class='card'>
@@ -2242,6 +2827,18 @@ class AppHandler(BaseHTTPRequestHandler):
         </div>
         """
         return html_page("Athlete Dashboard", body, user)
+
+    def athlete_calendar(self, user: sqlite3.Row, month_value: str = "") -> str:
+        athlete = self.athlete_context(user)
+        if athlete is None:
+            return html_page("Athlete Calendar", "<div class='card'>No athlete profile is linked to this account.</div>", user)
+        month_value = month_value or month_key(month_start())
+        body = f"""
+        <div class='stack'>
+          {render_calendar(self.athlete_schedule_entries(athlete), month_value, '/athlete/calendar')}
+        </div>
+        """
+        return html_page("Athlete Calendar", body, user)
 
     def complete_assignment(self, user: sqlite3.Row, path: str) -> None:
         assignment_id = to_int(path.split("/")[3], 0)
